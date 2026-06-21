@@ -11,14 +11,35 @@ A little Windows tool that watches your Elden Ring save file while you play, aut
 - **Verifies every restore**: after copying a checkpoint back, it double-checks the copy actually matches byte-for-byte before calling it done.
 - **Cleans up after itself**: keeps the most recent 30 snapshots it created and deletes older ones automatically, so it doesn't quietly fill your disk. It never touches files that were already there before it started (including any manual backups you made yourself).
 - **Shows a small on-screen overlay** with what it's been doing, and writes a full log to `save_changes.log` next to the program.
+- **Plays two different sounds** so you can tell what just happened without looking at the overlay: a short single beep when a new snapshot is taken, and a longer two-tone beep when a checkpoint has actually been restored.
+
+## What to do after you die
+
+1. Die as normal and let the death animation play out.
+2. From the death screen, go back to the **main menu** instead of continuing to play — don't keep playing on the spot, since the game can overwrite the restore again while you're actively still in the session.
+3. Wait. The tool needs your health/runes to stay in an "unclean" state for a little while before it acts, so the restore doesn't happen instantly.
+4. Listen for the **two-tone restore sound**. That's your signal that the last good checkpoint has been copied back over your save.
+5. Only now click **Continue**. Loading before the sound plays means you'd load the version of the save before the restore happened.
+
+## Requirements
+
+- **Python 3** installed on Windows, including **tkinter** (bundled by default with the official python.org installer — just don't deselect it during setup).
+- No `pip install` of anything else — the script only uses Python's standard library (`tkinter`, `hashlib`, `struct`, `winsound`, etc.).
+- No admin rights needed — it only reads/writes your own save folder and writes its log next to the script.
 
 ## Running it
+
+Open a terminal (cmd or PowerShell) in the folder containing `er_save_watcher.py` and run:
 
 ```
 python er_save_watcher.py [save_dir]
 ```
 
-`save_dir` is the folder containing `ER0000.sl2`. If you don't pass one, it tries to auto-detect it from `%APPDATA%\EldenRing\<your SteamID>\` — this only works automatically if you've only ever played with one Steam account on this PC; otherwise you'll need to pass the path yourself.
+`save_dir` is the folder containing `ER0000.sl2`. If you don't pass one, it tries to auto-detect it from `%APPDATA%\EldenRing\<your SteamID>\` — this only works automatically if you've only ever played with one Steam account on this PC; otherwise you'll need to pass the path yourself, e.g.:
+
+```
+python er_save_watcher.py "C:\Users\<you>\AppData\Roaming\EldenRing\<your SteamID>"
+```
 
 ## Known limitations
 

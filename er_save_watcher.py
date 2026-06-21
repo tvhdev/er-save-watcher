@@ -2,85 +2,28 @@
 r"""
 ER0000.sl2 Save File Watcher + Auto-Restore + On-Screen Overlay.
 
-Monitors the Elden Ring save file for changes, logs each detected change
-to a text file, and shows a small always-on-top overlay window with the
-most recent events.
+Watches the Elden Ring save file, snapshots it into numbered
+"ER0000 - Kopie (N).sl2" files whenever the state is "clean" (health > 0
+and souls > 0 -- see is_clean_state()), and can restore an earlier
+snapshot back over the live save. Pre-existing Kopie files and
+ER0000-backup.sl2 are never renamed, overwritten, or deleted.
 
-Every time a real content change is detected in the live save, the
-character's current health AND rune count ("souls" in the save format)
-are both checked (see is_clean_state()): only if BOTH are nonzero is the
-new content snapshotted into a freshly numbered "ER0000 - Kopie (N).sl2"
-file (N = highest existing number + 1) -- this builds a rolling history
-of checkpoints over the session. health == 0 means death; health > 0 but
-souls == 0 means alive again but the dropped runes haven't been reclaimed
-yet (the window right after respawning) -- neither is a "clean" state
-worth keeping as a checkpoint, so both are excluded. Pre-existing numbered
-Kopie files (and ER0000-backup.sl2) are never renamed, overwritten, or
-deleted -- only new ones are ever added.
+Two restore paths:
+- Idle-based: after INACTIVITY_RESTORE_SECONDS with no change, restores
+  the 6th-to-last snapshot (assumes the player went to the menu to retry).
+- Death-based: if health/souls go unclean and stay that way for
+  DEATH_RESTORE_DELAY_SECONDS, restores the latest clean snapshot. The
+  delay matters because Elden Ring holds authoritative state in memory
+  while running and can overwrite our restore with its own next autosave
+  -- see _check_death()/_restore_after_death() for the full reasoning.
 
-If the live save then goes INACTIVITY_RESTORE_SECONDS without a further
-content change, it is assumed the player returned to the main menu to
-retry a saved state. The 6TH-TO-LAST numbered Kopie file is copied over
-ER0000.sl2 -- not the latest one, since that is just the snapshot of the
-current (idle) state itself and restoring it would be a no-op; 6th-to-last
-rewinds five checkpoints further back than that. If fewer than six
-numbered Kopie files exist yet, the restore is skipped and logged as a
-failure instead of guessing. This is a heuristic with no extra safety net
-beyond the checkpoint history itself: it overwrites the live save directly.
-
-Death/unclean-state detection: every poll tick (not just when a content
-change is detected), health and souls are read by properly parsing the
-save structure forward from the start of the character slot: header,
-then the 0x1400-entry ga_items array (each entry is 8/16/25 bytes
-depending on item type -- there is NO fixed offset for anything after it,
-since it shifts whenever held/equipped items change), then
-PlayerGameData, then +8 (health) / +100 (souls) bytes. This mirrors the
-struct layout in ClayAmore/ER-Save-Editor's save_slot.rs (see
-_find_player_game_data_start() below). Health is checked rather than
-relying on souls alone because health hits 0 the instant death triggers,
-while souls aren't zeroed until later in the death sequence -- a snapshot
-taken in that gap can have health=0 but a still-nonzero souls value, which
-is exactly the contamination a souls-only check was vulnerable to. The
-restore trigger is is_clean_state() being False, i.e. EITHER health == 0
-(mid-death) OR souls == 0 (alive again post-respawn, but the dropped
-runes haven't been reclaimed yet) -- not health alone, since exiting the
-game in that second state with no further death would otherwise never
-get caught. Once an unclean state is observed, the restore is not fired
-immediately -- it waits DEATH_RESTORE_DELAY_SECONDS, re-checking every
-tick, and only proceeds if the state is still unclean once the delay
-elapses (if it becomes clean again in the meantime, e.g. the player
-respawned AND reclaimed their runes, the pending restore is cancelled).
-This delay is not just debouncing a transient read: while Elden Ring is
-still running, it holds the authoritative state in memory and can
-overwrite our restore again with its own next autosave moments later
-(verified empirically -- manually copying a Kopie file over ER0000.sl2
-only "sticks" if done before the game is reloaded, not while it's
-actively running). Staying unclean for the full delay is a proxy for
-"the player has stopped actively playing this session" (e.g. quit to the
-title screen, or died and hasn't yet respawned) rather than merely
-"enough time for one write to settle". Once confirmed, the latest
-existing Kopie snapshot that is itself a clean state is copied back over
-ER0000.sl2 (older snapshots, e.g. pre-existing manual backups from
-before this feature existed, are checked one by one until a clean one is
-found). Only one restore attempt is made per unclean episode; it re-arms
-once the state is seen clean again.
-
-Every restore (death-triggered or idle-triggered) is performed via
-copy_and_verify(): after copying, the MD5 of the source and of the
-now-restored ER0000.sl2 are compared, and the whole copy is retried (up
-to RESTORE_VERIFY_MAX_ATTEMPTS times) if they don't match -- a plain copy
-can silently leave the live file out of sync if the game touches either
-file at the same moment.
-
-Since a new ~29MB snapshot is written on every detected change, long
-sessions with frequent autosaves accumulate disk usage quickly. To bound
-this, once more than KOPIE_RETENTION_COUNT snapshots have been created by
-THIS watcher instance during this run, the oldest ones are deleted as new
-ones are added (see _prune_old_kopies()). Only snapshots the watcher
-itself created are ever eligible for deletion -- pre-existing Kopie files
-already present when the watcher started (including manual backups) are
-never tracked for pruning and so are never touched, preserving the
-guarantee above.
+Health/souls are located by parsing the save structurally (header, the
+variable-length ga_items array, then PlayerGameData) rather than via a
+fixed offset, since item changes shift everything after that array --
+see _find_player_game_data_start(). Every restore is verified via
+copy_and_verify() (MD5 compare + retry). Snapshots this instance creates
+beyond KOPIE_RETENTION_COUNT are pruned oldest-first (_prune_old_kopies());
+pre-existing files are never touched.
 
 Usage (Windows, Python 3 installed):
     python er_save_watcher.py [save_dir]
