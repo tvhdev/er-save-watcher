@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+r"""
+ER0000.sl2 Save File Watcher + Auto-Restore + On-Screen Overlay.
+
+Monitors the Elden Ring save file for changes, logs each detected change
+to a text file, and shows a small always-on-top overlay window with the
+most recent events.
+
+Every time a real content change is detected in the live save, the
+character's current health AND rune count ("souls" in the save format)
+are both checked (see is_clean_state()): only if BOTH are nonzero is the
+new content snapshotted into a freshly numbered "ER0000 - Kopie (N).sl2"
+file (N = highest existing number + 1) -- this builds a rolling history
+of checkpoints over the session. health == 0 means death; health > 0 but
+souls == 0 means alive again but the dropped runes haven't been reclaimed
+yet (the window right after respawning) -- neither is a "clean" state
+worth keeping as a checkpoint, so both are excluded. Pre-existing numbered
+Kopie files (and ER0000-backup.sl2) are never renamed, overwritten, or
+deleted -- only new ones are ever added.
+
+If the live save then goes INACTIVITY_RESTORE_SECONDS without a further
+content change, it is assumed the player returned to the main menu to
+retry a saved state. The 6TH-TO-LAST numbered Kopie file is copied over
+ER0000.sl2 -- not the latest one, since that is just the snapshot of the
+current (idle) state itself and restoring it would be a no-op; 6th-to-last
+rewinds five checkpoints further back than that. If fewer than six
+numbered Kopie files exist yet, the restore is skipped and logged as a
+failure instead of guessing. This is a heuristic with no extra safety net
+beyond the checkpoint history itself: it overwrites the live save directly.
+
+Death/unclean-state detection: every poll tick (not just when a content
+change is detected), health and souls are read by properly parsing the
+save structure forward from the start of the character slot: header,
+then the 0x1400-entry ga_items array (each entry is 8/16/25 bytes
+depending on item type -- there is NO fixed offset for anything after it,
+since it shifts whenever held/equipped items change), then
+PlayerGameData, then +8 (health) / +100 (souls) bytes. This mirrors the
+struct layout in ClayAmore/ER-Save-Editor's save_slot.rs (see
+_find_player_game_data_start() below). Health is checked rather than
+relying on souls alone because health hits 0 the instant death triggers,
+while souls aren't zeroed until later in the death sequence -- a snapshot
+taken in that gap can have health=0 but a still-nonzero souls value, which
+is exactly the contamination a souls-only check was vulnerable to. The
+restore trigger is is_clean_state() being False, i.e. EITHER health == 0
+(mid-death) OR souls == 0 (alive again post-respawn, but the dropped
+runes haven't been reclaimed yet) -- not health alone, since exiting the
+game in that second state with no further death would otherwise never
+get caught. Once an unclean state is observed, the restore is not fired
+immediately -- it waits DEATH_RESTORE_DELAY_SECONDS, re-checking every
+tick, and only proceeds if the state is still unclean once the delay
+elapses (if it becomes clean again in the meantime, e.g. the player
+respawned AND reclaimed their runes, the pending restore is cancelled).
+This delay is not just debouncing a transient read: while Elden Ring is
+still running, it holds the authoritative state in memory and can
+overwrite our restore again with its own next autosave moments later
+(verified empirically -- manually copying a Kopie file over ER0000.sl2
+only "sticks" if done before the game is reloaded, not while it's
+actively running). Staying unclean for the full delay is a proxy for
+"the player has stopped actively playing this session" (e.g. quit to the
+title screen, or died and hasn't yet respawned) rather than merely
+"enough time for one write to settle". Once confirmed, the latest
+existing Kopie snapshot that is itself a clean state is copied back over
+ER0000.sl2 (older snapshots, e.g. pre-existing manual backups from
+before this feature existed, are checked one by one until a clean one is
+found). Only one restore attempt is made per unclean episode; it re-arms
+once the state is seen clean again.
+
+Every restore (death-triggered or idle-triggered) is performed via
+copy_and_verify(): after copying, the MD5 of the source and of the
+now-restored ER0000.sl2 are compared, and the whole copy is retried (up
+to RESTORE_VERIFY_MAX_ATTEMPTS times) if they don't match -- a plain copy
+can silently leave the live file out of sync if the game touches either
+file at the same moment.
+
+Since a new ~29MB snapshot is written on every detected change, long
+sessions with frequent autosaves accumulate disk usage quickly. To bound
+this, once more than KOPIE_RETENTION_COUNT snapshots have been created by
+THIS watcher instance during this run, the oldest ones are deleted as new
+ones are added (see _prune_old_kopies()). Only snapshots the watcher
+itself created are ever eligible for deletion -- pre-existing Kopie files
+already present when the watcher started (including manual backups) are
+never tracked for pruning and so are never touched, preserving the
+guarantee above.
+
+Usage (Windows, Python 3 installed):
+    python er_save_watcher.py [save_dir]
+
+    save_dir is the EldenRing save folder containing ER0000.sl2. If omitted,
+    it's auto-detected from %APPDATA%\EldenRing\<SteamID64>\ as long as
+    there's exactly one SteamID subfolder there; otherwise it's required.
+
+Overlay limitations:
+    The overlay is a normal always-on-top desktop window. It will show up
+    fine over Elden Ring running in Borderless Windowed mode. True
+    exclusive Fullscreen mode in DirectX can paint over any external
+    topmost window -- that is a Windows/DirectX limitation no external
+    script can bypass. If the overlay does not appear over the game,
+    switch Elden Ring's display mode to Borderless/Windowed.
+
+Controls:
+    Drag the overlay's title bar to reposition it.
+    Click the "x" button to close the overlay (the watcher and its log
+    keep running until the process exits).
+"""
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import struct
+import sys
+import threading
+import time
+import tkinter as tk
+from collections import deque
+from datetime import datetime
+
+try:
+    import winsound  # Windows-only stdlib module
+except ImportError:
+    winsound = None
+
+# ---- Configuration ---------------------------------------------------
+
+KOPIE_NAME_RE = re.compile(r"^ER0000 - Kopie(?: \((\d+)\))?\.sl2$")
+# sys.executable is the .exe itself when frozen by PyInstaller; __file__ would
+# otherwise resolve to a temp extraction folder that's deleted on exit.
+_APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(_APP_DIR, "save_changes.log")
+POLL_INTERVAL_SECONDS = 1.0
+MAX_EVENTS_SHOWN = 8
+INACTIVITY_RESTORE_SECONDS = 30
+DEATH_RESTORE_DELAY_SECONDS = 15
+RESTORE_VERIFY_MAX_ATTEMPTS = 5
+KOPIE_RETENTION_COUNT = 30  # how many watcher-created snapshots to keep before pruning the oldest; see _prune_old_kopies()
+ENABLE_AUTO_RESTORE = False  # idle-based rewind; paused during death-marker research, independent of death-restore below
+ENABLE_DEATH_RESTORE = True
+SLOT0_DATA_START = 0x310
+GA_ITEM_COUNT = 0x1400  # number of GaItem slots preceding PlayerGameData, per ER-Save-Editor's SaveSlot::read()
+HEALTH_REL_OFFSET = 8  # byte offset of `health` within PlayerGameData, per its struct field order
+SOULS_REL_OFFSET = 100  # byte offset of `souls` (= runes) within PlayerGameData, per its struct field order
+READ_PREFIX_SIZE = 0x40000  # comfortably covers the header + worst-case ga_items array + PlayerGameData header
+
+
+def find_default_save_dir():
+    """
+    EldenRing saves live at %APPDATA%\\EldenRing\\<SteamID64>\\. The SteamID64
+    part can't be known generically, but most machines have only ever had one
+    Steam account play, so auto-pick it if there's exactly one such subfolder.
+    Returns None if APPDATA isn't set, the EldenRing folder doesn't exist, or
+    there's more than one (or zero) candidate subfolders -- the caller must
+    then require an explicit save_dir argument.
+    """
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    base = os.path.join(appdata, "EldenRing")
+    if not os.path.isdir(base):
+        return None
+    candidates = [d for d in os.listdir(base) if d.isdigit() and os.path.isdir(os.path.join(base, d))]
+    if len(candidates) == 1:
+        return os.path.join(base, candidates[0])
+    return None
+
+
+def _find_player_game_data_start(buf):
+    """
+    Walks the variable-length ga_items array (each entry is 8, 16, or 25 bytes
+    depending on item type) to find where PlayerGameData begins. There is no
+    fixed offset for this -- it shifts whenever held/equipped items change.
+    Mirrors GaItem::read() in ClayAmore/ER-Save-Editor's save_slot.rs.
+    """
+    pos = 4 + 4 + 0x18  # ver + map_id + unknown padding, relative to slot start
+    for _ in range(GA_ITEM_COUNT):
+        item_id = struct.unpack_from("<I", buf, pos + 4)[0]
+        pos += 8  # gaitem_handle + item_id
+        high_nibble = item_id & 0xF0000000
+        if item_id != 0 and high_nibble == 0:
+            pos += 4 + 4 + 4 + 1  # weapon-type GaItem
+        elif item_id != 0 and high_nibble == 0x10000000:
+            pos += 4 + 4  # armor-type GaItem
+    return pos
+
+
+def read_vitals(path):
+    """Returns (health, souls) for the save at path, or (None, None) on any read failure."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(SLOT0_DATA_START)
+            buf = f.read(READ_PREFIX_SIZE)
+    except OSError:
+        return None, None
+    try:
+        player_game_data_start = _find_player_game_data_start(buf)
+        health = struct.unpack_from("<I", buf, player_game_data_start + HEALTH_REL_OFFSET)[0]
+        souls = struct.unpack_from("<I", buf, player_game_data_start + SOULS_REL_OFFSET)[0]
+        return health, souls
+    except struct.error:
+        return None, None
+
+
+def is_clean_state(health, souls):
+    """
+    A snapshot/state is only trustworthy as a "good" checkpoint if the player
+    is both alive (health > 0) AND has already reclaimed their runes
+    (souls > 0). The gap right after respawning -- alive again, but runes
+    still sitting unclaimed at the death location -- is excluded too, not
+    just the moment of death itself. None readings are treated as "allow"
+    since we can't determine the state and don't want to block on that.
+    """
+    if health is None or souls is None:
+        return True
+    return health != 0 and souls != 0
+
+
+def _md5_file(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def copy_and_verify(source, dest, max_attempts=RESTORE_VERIFY_MAX_ATTEMPTS):
+    """
+    Copies source -> dest, then confirms the MD5s actually match -- a plain
+    shutil.copy2() can silently leave dest out of sync with source if the
+    game is touching either file at the same moment. Retries the whole copy
+    (not just the comparison) up to max_attempts times if they don't match.
+    Returns (True, None) on success, or (False, last_exception_or_None).
+    """
+    last_exc = None
+    for _ in range(max_attempts):
+        try:
+            shutil.copy2(source, dest)
+            if _md5_file(source) == _md5_file(dest):
+                return True, None
+        except OSError as exc:
+            last_exc = exc
+    return False, last_exc
+
+
+def list_numbered_kopies(save_dir):
+    """Return [(number, path), ...] for files matching the Kopie naming scheme, newest (highest number) first."""
+    found = []
+    for name in os.listdir(save_dir):
+        match = KOPIE_NAME_RE.match(name)
+        if match:
+            number = int(match.group(1)) if match.group(1) else 1
+            found.append((number, os.path.join(save_dir, name)))
+    found.sort(key=lambda pair: pair[0], reverse=True)
+    return found
+
+
+def next_kopie_path(save_dir):
+    existing = list_numbered_kopies(save_dir)
+    next_number = existing[0][0] + 1 if existing else 1
+    name = "ER0000 - Kopie.sl2" if next_number == 1 else f"ER0000 - Kopie ({next_number}).sl2"
+    return os.path.join(save_dir, name)
+
+# ---- File watcher ------------------------------------------------------
+
+
+class SaveWatcher:
+    def __init__(self, path, on_change, on_snapshot, on_snapshot_failed, on_restore, on_restore_failed,
+                 on_death_restore, on_death_restore_failed, on_prune, on_prune_failed):
+        self.path = path
+        self.save_dir = os.path.dirname(path)
+        self.on_change = on_change
+        self.on_snapshot = on_snapshot
+        self.on_snapshot_failed = on_snapshot_failed
+        self.on_restore = on_restore
+        self.on_restore_failed = on_restore_failed
+        self.on_death_restore = on_death_restore
+        self.on_death_restore_failed = on_death_restore_failed
+        self.on_prune = on_prune
+        self.on_prune_failed = on_prune_failed
+        self._last_size = None
+        self._last_mtime = None
+        self._last_hash = None
+        self._last_change_monotonic = None
+        self._restored_for_idle_period = False
+        self._restore_failure_notified = False
+        self._death_restore_pending = False
+        self._death_detected_monotonic = None
+        self._own_kopie_paths = []  # only snapshots created by this watcher instance; pre-existing files are never tracked here
+        self._stop = threading.Event()
+
+    def _hash_file(self, path):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _poll_once(self):
+        try:
+            stat = os.stat(self.path)
+        except FileNotFoundError:
+            return
+        size, mtime = stat.st_size, stat.st_mtime
+        if size == self._last_size and mtime == self._last_mtime:
+            return
+        try:
+            digest = self._hash_file(self.path)
+        except OSError:
+            return  # file briefly locked by the game; retry next tick
+        if digest == self._last_hash:
+            self._last_size, self._last_mtime = size, mtime
+            return
+        delta = None if self._last_size is None else size - self._last_size
+        self._last_size, self._last_mtime, self._last_hash = size, mtime, digest
+        self._last_change_monotonic = time.monotonic()
+        self._restored_for_idle_period = False
+        self._restore_failure_notified = False
+        self.on_change(size, delta, digest[:12])
+        if delta is None:  # don't snapshot the initial baseline read, only real changes
+            return
+        health, souls = read_vitals(self.path)
+        if is_clean_state(health, souls):
+            self._snapshot_change()
+
+    def _check_death(self):
+        health, souls = read_vitals(self.path)
+        if health is None or souls is None:
+            return
+        if is_clean_state(health, souls):
+            self._death_restore_pending = False
+            self._death_detected_monotonic = None
+            return
+        if self._death_restore_pending:
+            return  # already attempted a restore for this unclean episode; wait for it to clear
+        if self._death_detected_monotonic is None:
+            self._death_detected_monotonic = time.monotonic()
+            return  # unclean state just observed; wait out DEATH_RESTORE_DELAY_SECONDS before acting
+        if time.monotonic() - self._death_detected_monotonic < DEATH_RESTORE_DELAY_SECONDS:
+            return  # still within the delay window; re-checked (and re-armed above) every tick
+        self._death_restore_pending = True
+        self._restore_after_death(health, souls)
+
+    def _snapshot_change(self):
+        try:
+            dest = next_kopie_path(self.save_dir)
+            shutil.copy2(self.path, dest)  # new file only; never overwrites an existing Kopie file
+        except OSError as exc:
+            self.on_snapshot_failed(str(exc))
+            return
+        self._own_kopie_paths.append(dest)
+        self.on_snapshot(os.path.basename(dest))
+        self._prune_old_kopies()
+
+    def _prune_old_kopies(self):
+        # Only ever deletes snapshots THIS instance created (tracked in
+        # _own_kopie_paths) -- pre-existing files present at startup, manual
+        # backups included, are never added to that list and so never touched.
+        while len(self._own_kopie_paths) > KOPIE_RETENTION_COUNT:
+            oldest = self._own_kopie_paths.pop(0)
+            try:
+                os.remove(oldest)
+            except OSError as exc:
+                self.on_prune_failed(str(exc))
+                continue
+            self.on_prune(os.path.basename(oldest))
+
+    def _restore_after_death(self, trigger_health, trigger_souls):
+        try:
+            kopies = list_numbered_kopies(self.save_dir)
+        except OSError as exc:
+            self.on_death_restore_failed(str(exc))
+            return
+        source = None
+        for _, candidate in kopies:  # newest first; skip any that aren't a clean (alive + runes reclaimed) state
+            health, souls = read_vitals(candidate)
+            if health is not None and souls is not None and health != 0 and souls != 0:
+                source = candidate
+                break
+        if source is None:
+            self.on_death_restore_failed("no clean (health > 0 and souls > 0) snapshot found to restore from")
+            return
+        ok, exc = copy_and_verify(source, self.path)  # one-way copy; source file is never renamed/moved/deleted
+        if not ok:
+            reason = str(exc) if exc else f"MD5 of restored file never matched source after {RESTORE_VERIFY_MAX_ATTEMPTS} attempts"
+            self.on_death_restore_failed(reason)
+            return
+        stat = os.stat(self.path)
+        self._last_size, self._last_mtime = stat.st_size, stat.st_mtime
+        self._last_hash = self._hash_file(self.path)
+        self.on_death_restore(os.path.basename(source), trigger_health, trigger_souls)
+
+    def _maybe_restore(self):
+        if self._last_change_monotonic is None or self._restored_for_idle_period:
+            return
+        idle = time.monotonic() - self._last_change_monotonic
+        if idle < INACTIVITY_RESTORE_SECONDS:
+            return
+        try:
+            kopies = list_numbered_kopies(self.save_dir)
+        except OSError as exc:
+            if not self._restore_failure_notified:
+                self.on_restore_failed(str(exc))
+                self._restore_failure_notified = True
+            return
+        if len(kopies) < 6:
+            self._restored_for_idle_period = True
+            self.on_restore_failed(f"not enough snapshot history to rewind (found {len(kopies)}, need 6)")
+            return
+        _, source = kopies[5]  # 6th-to-last: kopies[0] is just the snapshot of the current idle state
+        ok, exc = copy_and_verify(source, self.path)  # one-way copy; source file is never renamed/moved/deleted
+        if not ok:
+            if not self._restore_failure_notified:
+                reason = str(exc) if exc else f"MD5 of restored file never matched source after {RESTORE_VERIFY_MAX_ATTEMPTS} attempts"
+                self.on_restore_failed(reason)
+                self._restore_failure_notified = True
+            return  # likely locked by the game; retry next tick
+        stat = os.stat(self.path)
+        self._last_size, self._last_mtime = stat.st_size, stat.st_mtime
+        self._last_hash = self._hash_file(self.path)
+        self._last_change_monotonic = time.monotonic()
+        self._restored_for_idle_period = True
+        self.on_restore(idle, os.path.basename(source))
+
+    def run(self):
+        while not self._stop.is_set():
+            if ENABLE_DEATH_RESTORE:
+                self._check_death()  # polled every tick, independent of hash-based change detection
+            self._poll_once()
+            if ENABLE_AUTO_RESTORE:
+                self._maybe_restore()
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+    def stop(self):
+        self._stop.set()
+
+
+# ---- Logging -------------------------------------------------------------
+
+
+def _write_log(line):
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def log_change(size, delta, short_hash):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    delta_str = "first snapshot" if delta is None else f"{delta:+d} bytes"
+    line = f"[{timestamp}] size={size} ({delta_str}) hash={short_hash}"
+    _write_log(line)
+    return f"{timestamp}  {delta_str}  #{short_hash}"
+
+
+def log_snapshot(name):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] snapshot saved as '{name}'"
+    _write_log(line)
+    return f"{timestamp}  snapshot saved as '{name}'"
+
+
+def log_snapshot_failed(reason):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] SNAPSHOT FAILED: {reason}"
+    _write_log(line)
+    return f"{timestamp}  SNAPSHOT FAILED: {reason}"
+
+
+def log_prune(name):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] pruned old snapshot '{name}' (retention: {KOPIE_RETENTION_COUNT})"
+    _write_log(line)
+    return f"{timestamp}  pruned '{name}'"
+
+
+def log_prune_failed(reason):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] PRUNE FAILED: {reason}"
+    _write_log(line)
+    return f"{timestamp}  PRUNE FAILED: {reason}"
+
+
+def log_restore(idle_seconds, source_name):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] AUTO-RESTORED '{source_name}' -> live save (idle {idle_seconds:.0f}s)"
+    _write_log(line)
+    return f"{timestamp}  RESTORED '{source_name}' (idle {idle_seconds:.0f}s)"
+
+
+def log_restore_failed(reason):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] RESTORE FAILED: {reason}"
+    _write_log(line)
+    return f"{timestamp}  RESTORE FAILED: {reason}"
+
+
+def log_death_restore(source_name, health, souls):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] UNCLEAN STATE (health={health}, souls={souls}) -- RESTORED '{source_name}' -> live save"
+    _write_log(line)
+    return f"{timestamp}  RESTORED '{source_name}' (was health={health}, souls={souls})"
+
+
+def log_death_restore_failed(reason):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] DEATH DETECTED but RESTORE FAILED: {reason}"
+    _write_log(line)
+    return f"{timestamp}  DIED but restore failed: {reason}"
+
+
+def play_snapshot_sound():
+    if winsound is None:
+        return
+    try:
+        winsound.Beep(440, 80)  # short single tone, distinct from the restore sound
+    except RuntimeError:
+        pass
+
+
+def play_restore_sound():
+    if winsound is None:
+        return
+    try:
+        # Beep() drives a tone directly instead of relying on the Windows sound
+        # scheme, which MessageBeep() does -- many systems mute/disable that.
+        winsound.Beep(660, 150)
+        winsound.Beep(880, 200)
+    except RuntimeError:
+        pass
+
+
+# ---- Overlay ---------------------------------------------------------------
+
+
+class Overlay:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.root.attributes("-alpha", 0.85)
+        self.root.configure(bg="black")
+        self.root.geometry("+40+40")
+
+        header = tk.Frame(self.root, bg="#202020")
+        header.pack(fill="x")
+        tk.Label(
+            header, text="ER0000.sl2 Watcher", fg="white", bg="#202020",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left", padx=6, pady=2)
+        tk.Button(
+            header, text="x", fg="white", bg="#202020", bd=0,
+            command=self.root.destroy, font=("Segoe UI", 9, "bold"),
+        ).pack(side="right", padx=4)
+
+        self.body = tk.Label(
+            self.root, text="Waiting for changes...", fg="#33ff66", bg="black",
+            justify="left", anchor="w", font=("Consolas", 9), padx=8, pady=6,
+        )
+        self.body.pack(fill="both", expand=True)
+
+        for widget in (self.root, header, self.body):
+            widget.bind("<ButtonPress-1>", self._start_move)
+            widget.bind("<B1-Motion>", self._do_move)
+
+        self.events = deque(maxlen=MAX_EVENTS_SHOWN)
+        self._offset = (0, 0)
+
+    def _start_move(self, event):
+        self._offset = (
+            event.x_root - self.root.winfo_x(),
+            event.y_root - self.root.winfo_y(),
+        )
+
+    def _do_move(self, event):
+        x = event.x_root - self._offset[0]
+        y = event.y_root - self._offset[1]
+        self.root.geometry(f"+{x}+{y}")
+
+    def push_event(self, text):
+        self.events.appendleft(text)
+        self.body.config(text="\n".join(self.events))
+
+    def schedule(self, callback, interval_ms=200):
+        def tick():
+            callback()
+            self.root.after(interval_ms, tick)
+        self.root.after(interval_ms, tick)
+
+    def mainloop(self):
+        self.root.mainloop()
+
+
+# ---- Wiring -----------------------------------------------------------------
+
+
+def parse_args():
+    auto_detected = find_default_save_dir()
+    parser = argparse.ArgumentParser(description="ER0000.sl2 save watcher with auto-restore and on-screen overlay.")
+    parser.add_argument(
+        "save_dir", nargs="?", default=auto_detected,
+        help="Path to the EldenRing save folder containing ER0000.sl2"
+             + (f" (default, auto-detected: {auto_detected})" if auto_detected else
+                " (required: couldn't auto-detect a unique folder under %APPDATA%\\EldenRing)"),
+    )
+    args = parser.parse_args()
+    if args.save_dir is None:
+        parser.error(
+            "no save_dir given and couldn't auto-detect one under %APPDATA%\\EldenRing "
+            "(either it doesn't exist, or there's more than one SteamID subfolder there) -- "
+            "pass the save folder path explicitly."
+        )
+    return args
+
+
+def main():
+    args = parse_args()
+    save_file = os.path.join(args.save_dir, "ER0000.sl2")
+
+    overlay = Overlay()
+    pending = deque()
+    pending_lock = threading.Lock()
+
+    def on_change(size, delta, short_hash):
+        line = log_change(size, delta, short_hash)
+        with pending_lock:
+            pending.append(line)
+
+    def on_snapshot(name):
+        line = log_snapshot(name)
+        with pending_lock:
+            pending.append(line)
+        play_snapshot_sound()
+
+    def on_snapshot_failed(reason):
+        line = log_snapshot_failed(reason)
+        with pending_lock:
+            pending.append(line)
+
+    def on_restore(idle_seconds, source_name):
+        line = log_restore(idle_seconds, source_name)
+        with pending_lock:
+            pending.append(line)
+
+    def on_restore_failed(reason):
+        line = log_restore_failed(reason)
+        with pending_lock:
+            pending.append(line)
+
+    def on_death_restore(source_name, health, souls):
+        line = log_death_restore(source_name, health, souls)
+        with pending_lock:
+            pending.append(line)
+        play_restore_sound()
+
+    def on_death_restore_failed(reason):
+        line = log_death_restore_failed(reason)
+        with pending_lock:
+            pending.append(line)
+
+    def on_prune(name):
+        line = log_prune(name)
+        with pending_lock:
+            pending.append(line)
+
+    def on_prune_failed(reason):
+        line = log_prune_failed(reason)
+        with pending_lock:
+            pending.append(line)
+
+    watcher = SaveWatcher(
+        save_file, on_change, on_snapshot, on_snapshot_failed, on_restore, on_restore_failed,
+        on_death_restore, on_death_restore_failed, on_prune, on_prune_failed,
+    )
+    thread = threading.Thread(target=watcher.run, daemon=True)
+    thread.start()
+
+    def drain_pending():
+        with pending_lock:
+            while pending:
+                overlay.push_event(pending.popleft())
+
+    overlay.schedule(drain_pending)
+    try:
+        overlay.mainloop()
+    finally:
+        watcher.stop()
+
+
+if __name__ == "__main__":
+    main()
