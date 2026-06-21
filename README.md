@@ -1,6 +1,6 @@
 # ER0000.sl2 Save Watcher
 
-A little Windows tool that watches your Elden Ring save file while you play, automatically keeps a history of checkpoints, and can undo a death by restoring your last good checkpoint — all without you having to manually copy files around.
+A little Windows tool that watches your Elden Ring save file while you play, and after your die, automatically restores your last good checkpoint — all without you having to manually copy files around.
 
 ## What it actually does
 
