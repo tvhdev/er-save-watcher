@@ -21,25 +21,48 @@ A little Windows tool that watches your Elden Ring save file while you play, aut
 4. Listen for the **two-tone restore sound**. That's your signal that the last good checkpoint has been copied back over your save.
 5. Only now click **Continue**. Loading before the sound plays means you'd load the version of the save before the restore happened.
 
-## Requirements
-
-- **Python 3** installed on Windows, including **tkinter** (bundled by default with the official python.org installer — just don't deselect it during setup).
-- No `pip install` of anything else — the script only uses Python's standard library (`tkinter`, `hashlib`, `struct`, `winsound`, etc.).
-- No admin rights needed — it only reads/writes your own save folder and writes its log next to the script.
-
 ## Running it
 
-Open a terminal (cmd or PowerShell) in the folder containing `er_save_watcher.py` and run:
+There are two ways to run this:
+
+### Option A: standalone .exe (no Python needed)
+
+Just double-click `ER_Save_Watcher.exe`, or run it from a terminal if you want to pass a save folder explicitly:
+
+```
+ER_Save_Watcher.exe [save_dir]
+```
+
+### Option B: run the Python script directly
+
+Requirements:
+- **Python 3** installed on Windows, including **tkinter** (bundled by default with the official python.org installer — just don't deselect it during setup).
+- No `pip install` of anything else — the script only uses Python's standard library (`tkinter`, `hashlib`, `struct`, `winsound`, etc.).
 
 ```
 python er_save_watcher.py [save_dir]
 ```
 
+### The save_dir argument (both options)
+
 `save_dir` is the folder containing `ER0000.sl2`. If you don't pass one, it tries to auto-detect it from `%APPDATA%\EldenRing\<your SteamID>\` — this only works automatically if you've only ever played with one Steam account on this PC; otherwise you'll need to pass the path yourself, e.g.:
 
 ```
-python er_save_watcher.py "C:\Users\<you>\AppData\Roaming\EldenRing\<your SteamID>"
+ER_Save_Watcher.exe "C:\Users\<you>\AppData\Roaming\EldenRing\<your SteamID>"
 ```
+
+No admin rights are needed either way — it only reads/writes your own save folder and writes its log next to wherever it's run from.
+
+### Building the .exe yourself
+
+If you change the script and want to rebuild the `.exe`:
+
+```
+pip install pyinstaller
+pyinstaller --onefile --windowed --name ER_Save_Watcher er_save_watcher.py
+```
+
+The result lands in `dist\ER_Save_Watcher.exe`.
 
 ## Known limitations
 
