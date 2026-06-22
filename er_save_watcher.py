@@ -8,14 +8,11 @@ and souls > 0 -- see is_clean_state()), and can restore an earlier
 snapshot back over the live save. Pre-existing Kopie files and
 ER0000-backup.sl2 are never renamed, overwritten, or deleted.
 
-Two restore paths:
-- Idle-based: after INACTIVITY_RESTORE_SECONDS with no change, restores
-  the 6th-to-last snapshot (assumes the player went to the menu to retry).
-- Death-based: if health/souls go unclean and stay that way for
-  DEATH_RESTORE_DELAY_SECONDS, restores the latest clean snapshot. The
-  delay matters because Elden Ring holds authoritative state in memory
-  while running and can overwrite our restore with its own next autosave
-  -- see _check_death()/_restore_after_death() for the full reasoning.
+Restore path: if health/souls go unclean and stay that way for
+DEATH_RESTORE_DELAY_SECONDS, restores the latest clean snapshot. The
+delay matters because Elden Ring holds authoritative state in memory
+while running and can overwrite our restore with its own next autosave
+-- see _check_death()/_restore_after_death() for the full reasoning.
 
 Health/souls are located by parsing the save structurally (header, the
 variable-length ga_items array, then PlayerGameData) rather than via a
@@ -73,11 +70,9 @@ _APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else
 LOG_FILE = os.path.join(_APP_DIR, "save_changes.log")
 POLL_INTERVAL_SECONDS = 1.0
 MAX_EVENTS_SHOWN = 8
-INACTIVITY_RESTORE_SECONDS = 30
 DEATH_RESTORE_DELAY_SECONDS = 15
 RESTORE_VERIFY_MAX_ATTEMPTS = 5
 KOPIE_RETENTION_COUNT = 30  # how many watcher-created snapshots to keep before pruning the oldest; see _prune_old_kopies()
-ENABLE_AUTO_RESTORE = False  # idle-based rewind; paused during death-marker research, independent of death-restore below
 ENABLE_DEATH_RESTORE = True
 SLOT0_DATA_START = 0x310
 GA_ITEM_COUNT = 0x1400  # number of GaItem slots preceding PlayerGameData, per ER-Save-Editor's SaveSlot::read()
@@ -206,15 +201,13 @@ def next_kopie_path(save_dir):
 
 
 class SaveWatcher:
-    def __init__(self, path, on_change, on_snapshot, on_snapshot_failed, on_restore, on_restore_failed,
+    def __init__(self, path, on_change, on_snapshot, on_snapshot_failed,
                  on_death_restore, on_death_restore_failed, on_prune, on_prune_failed):
         self.path = path
         self.save_dir = os.path.dirname(path)
         self.on_change = on_change
         self.on_snapshot = on_snapshot
         self.on_snapshot_failed = on_snapshot_failed
-        self.on_restore = on_restore
-        self.on_restore_failed = on_restore_failed
         self.on_death_restore = on_death_restore
         self.on_death_restore_failed = on_death_restore_failed
         self.on_prune = on_prune
@@ -222,9 +215,6 @@ class SaveWatcher:
         self._last_size = None
         self._last_mtime = None
         self._last_hash = None
-        self._last_change_monotonic = None
-        self._restored_for_idle_period = False
-        self._restore_failure_notified = False
         self._death_restore_pending = False
         self._death_detected_monotonic = None
         self._own_kopie_paths = []  # only snapshots created by this watcher instance; pre-existing files are never tracked here
@@ -254,9 +244,6 @@ class SaveWatcher:
             return
         delta = None if self._last_size is None else size - self._last_size
         self._last_size, self._last_mtime, self._last_hash = size, mtime, digest
-        self._last_change_monotonic = time.monotonic()
-        self._restored_for_idle_period = False
-        self._restore_failure_notified = False
         self.on_change(size, delta, digest[:12])
         if delta is None:  # don't snapshot the initial baseline read, only real changes
             return
@@ -331,45 +318,11 @@ class SaveWatcher:
         self._last_hash = self._hash_file(self.path)
         self.on_death_restore(os.path.basename(source), trigger_health, trigger_souls)
 
-    def _maybe_restore(self):
-        if self._last_change_monotonic is None or self._restored_for_idle_period:
-            return
-        idle = time.monotonic() - self._last_change_monotonic
-        if idle < INACTIVITY_RESTORE_SECONDS:
-            return
-        try:
-            kopies = list_numbered_kopies(self.save_dir)
-        except OSError as exc:
-            if not self._restore_failure_notified:
-                self.on_restore_failed(str(exc))
-                self._restore_failure_notified = True
-            return
-        if len(kopies) < 6:
-            self._restored_for_idle_period = True
-            self.on_restore_failed(f"not enough snapshot history to rewind (found {len(kopies)}, need 6)")
-            return
-        _, source = kopies[5]  # 6th-to-last: kopies[0] is just the snapshot of the current idle state
-        ok, exc = copy_and_verify(source, self.path)  # one-way copy; source file is never renamed/moved/deleted
-        if not ok:
-            if not self._restore_failure_notified:
-                reason = str(exc) if exc else f"MD5 of restored file never matched source after {RESTORE_VERIFY_MAX_ATTEMPTS} attempts"
-                self.on_restore_failed(reason)
-                self._restore_failure_notified = True
-            return  # likely locked by the game; retry next tick
-        stat = os.stat(self.path)
-        self._last_size, self._last_mtime = stat.st_size, stat.st_mtime
-        self._last_hash = self._hash_file(self.path)
-        self._last_change_monotonic = time.monotonic()
-        self._restored_for_idle_period = True
-        self.on_restore(idle, os.path.basename(source))
-
     def run(self):
         while not self._stop.is_set():
             if ENABLE_DEATH_RESTORE:
                 self._check_death()  # polled every tick, independent of hash-based change detection
             self._poll_once()
-            if ENABLE_AUTO_RESTORE:
-                self._maybe_restore()
             time.sleep(POLL_INTERVAL_SECONDS)
 
     def stop(self):
@@ -418,20 +371,6 @@ def log_prune_failed(reason):
     line = f"[{timestamp}] PRUNE FAILED: {reason}"
     _write_log(line)
     return f"{timestamp}  PRUNE FAILED: {reason}"
-
-
-def log_restore(idle_seconds, source_name):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] AUTO-RESTORED '{source_name}' -> live save (idle {idle_seconds:.0f}s)"
-    _write_log(line)
-    return f"{timestamp}  RESTORED '{source_name}' (idle {idle_seconds:.0f}s)"
-
-
-def log_restore_failed(reason):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] RESTORE FAILED: {reason}"
-    _write_log(line)
-    return f"{timestamp}  RESTORE FAILED: {reason}"
 
 
 def log_death_restore(source_name, health, souls):
@@ -576,16 +515,6 @@ def main():
         with pending_lock:
             pending.append(line)
 
-    def on_restore(idle_seconds, source_name):
-        line = log_restore(idle_seconds, source_name)
-        with pending_lock:
-            pending.append(line)
-
-    def on_restore_failed(reason):
-        line = log_restore_failed(reason)
-        with pending_lock:
-            pending.append(line)
-
     def on_death_restore(source_name, health, souls):
         line = log_death_restore(source_name, health, souls)
         with pending_lock:
@@ -608,7 +537,7 @@ def main():
             pending.append(line)
 
     watcher = SaveWatcher(
-        save_file, on_change, on_snapshot, on_snapshot_failed, on_restore, on_restore_failed,
+        save_file, on_change, on_snapshot, on_snapshot_failed,
         on_death_restore, on_death_restore_failed, on_prune, on_prune_failed,
     )
     thread = threading.Thread(target=watcher.run, daemon=True)
