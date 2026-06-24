@@ -1,4 +1,5 @@
 *.log
+watcher_state_*.txt
 __pycache__/
 build/
 dist/
