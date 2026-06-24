@@ -18,9 +18,17 @@ Health/souls are located by parsing the save structurally (header, the
 variable-length ga_items array, then PlayerGameData) rather than via a
 fixed offset, since item changes shift everything after that array --
 see _find_player_game_data_start(). Every restore is verified via
-copy_and_verify() (MD5 compare + retry). Snapshots this instance creates
-beyond KOPIE_RETENTION_COUNT are pruned oldest-first (_prune_old_kopies());
-pre-existing files are never touched.
+copy_and_verify() (MD5 compare + retry). Snapshots numbered higher than
+the baseline recorded in WATCHER_STATE_FILE (the highest Kopie number
+that already existed the very first time the watcher ever ran here) are
+considered "ours" and pruned oldest-first beyond KOPIE_RETENTION_COUNT
+(_prune_old_kopies()); that baseline is persisted to disk specifically so
+pruning still works correctly across restarts -- an in-memory-only list
+would forget everything and need 30 fresh snapshots before pruning could
+resume each time the process restarts, which in practice is often (the
+watcher doesn't survive game restarts, crashes, or a PC reboot). Files at
+or below the baseline (manual backups predating the watcher) are never
+touched.
 
 Usage (Windows, Python 3 installed):
     python er_save_watcher.py [save_dir]
@@ -68,6 +76,7 @@ KOPIE_NAME_RE = re.compile(r"^ER0000 - Kopie(?: \((\d+)\))?\.sl2$")
 # otherwise resolve to a temp extraction folder that's deleted on exit.
 _APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(_APP_DIR, "save_changes.log")
+WATCHER_STATE_FILE = os.path.join(_APP_DIR, "watcher_state.txt")
 POLL_INTERVAL_SECONDS = 1.0
 MAX_EVENTS_SHOWN = 8
 DEATH_RESTORE_DELAY_SECONDS = 15
@@ -197,6 +206,30 @@ def next_kopie_path(save_dir):
     name = "ER0000 - Kopie.sl2" if next_number == 1 else f"ER0000 - Kopie ({next_number}).sl2"
     return os.path.join(save_dir, name)
 
+
+def load_or_init_kopie_baseline(save_dir):
+    """
+    Returns the Kopie number at or below which files are pre-existing (manual
+    backups predating the watcher, never touched) and above which they were
+    created by the watcher (eligible for pruning). Persisted to
+    WATCHER_STATE_FILE on first ever run so this distinction survives process
+    restarts -- without it, pruning would have no memory of which files it
+    already created and would never catch up.
+    """
+    try:
+        with open(WATCHER_STATE_FILE, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        pass
+    existing = list_numbered_kopies(save_dir)
+    baseline = existing[0][0] if existing else 0
+    try:
+        with open(WATCHER_STATE_FILE, "w", encoding="utf-8") as f:
+            f.write(str(baseline))
+    except OSError:
+        pass
+    return baseline
+
 # ---- File watcher ------------------------------------------------------
 
 
@@ -217,7 +250,7 @@ class SaveWatcher:
         self._last_hash = None
         self._death_restore_pending = False
         self._death_detected_monotonic = None
-        self._own_kopie_paths = []  # only snapshots created by this watcher instance; pre-existing files are never tracked here
+        self._kopie_baseline = load_or_init_kopie_baseline(self.save_dir)
         self._stop = threading.Event()
 
     def _hash_file(self, path):
@@ -276,16 +309,22 @@ class SaveWatcher:
         except OSError as exc:
             self.on_snapshot_failed(str(exc))
             return
-        self._own_kopie_paths.append(dest)
         self.on_snapshot(os.path.basename(dest))
         self._prune_old_kopies()
 
     def _prune_old_kopies(self):
-        # Only ever deletes snapshots THIS instance created (tracked in
-        # _own_kopie_paths) -- pre-existing files present at startup, manual
-        # backups included, are never added to that list and so never touched.
-        while len(self._own_kopie_paths) > KOPIE_RETENTION_COUNT:
-            oldest = self._own_kopie_paths.pop(0)
+        # Re-derived from disk every time, filtered to numbers above the
+        # persisted baseline, rather than an in-memory list -- that way
+        # pruning still works correctly after the watcher restarts (it
+        # doesn't survive game restarts, crashes, or a reboot), instead of
+        # forgetting everything and needing KOPIE_RETENTION_COUNT fresh
+        # snapshots before it can resume. Files at/below the baseline
+        # (pre-existing manual backups) are never included here.
+        own = sorted(
+            (number, p) for number, p in list_numbered_kopies(self.save_dir) if number > self._kopie_baseline
+        )
+        while len(own) > KOPIE_RETENTION_COUNT:
+            _, oldest = own.pop(0)
             try:
                 os.remove(oldest)
             except OSError as exc:
