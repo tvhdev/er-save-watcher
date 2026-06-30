@@ -9,18 +9,20 @@ Kopie files are never modified or deleted -- only new ones are added, and
 only watcher-created snapshots beyond KOPIE_RETENTION_COUNT are pruned.
 
 Games (-g/--game): er (Elden Ring, ER0000.sl2), dsr (Dark Souls
-Remastered, DRAKS0005.sl2), ds3 (Dark Souls III, DS30000.sl2). All three
-are BND4 containers; health/souls are read per game by read_vitals_er/
-dsr/ds3 (see those functions and the constants/comments above each for
-the format details and credits to the reverse-engineering projects we
-relied on). dsr/ds3 are AES-encrypted and need the 'cryptography' package
-(pip install cryptography); er is unencrypted and needs nothing extra.
+Remastered, DRAKS0005.sl2), ds3 (Dark Souls III, DS30000.sl2), ds2 (Dark
+Souls II: Scholar of the First Sin, DS2SOFS0000.sl2). All four are BND4
+containers; health/souls are read per game by read_vitals_er/dsr/ds3/ds2
+(see those functions and the constants/comments above each for the format
+details and credits to the reverse-engineering projects we relied on).
+dsr/ds3/ds2 are AES-encrypted and need the 'cryptography' package (pip
+install cryptography); er is unencrypted and needs nothing extra.
 
 Active-character detection: a .sl2 holds up to 10 characters but only the
-one being played is rewritten on save, so the active slot is the one whose
-BND4 entry checksum changes between saves (entry_fingerprints/changed_slot).
-Falls back to the first occupied slot until a save is observed; override
-with -s/--slot.
+one being played is rewritten on save, so the active slot is the BND4 entry
+whose checksum changes between saves (entry_fingerprints/changed_slot). The
+character entries are 0-9 for er/dsr/ds3 but 1-10 for ds2 (its entry 0 is a
+header rewritten every save); see GAME_PROFILES' char_entries. Falls back to
+the first occupied slot until a save is observed; override with -s/--slot.
 
 Death-restore gate: a restore fires only once the save has been unclean
 AND quiet (not written) for DEATH_RESTORE_DELAY_SECONDS -- i.e. you've quit
@@ -30,7 +32,7 @@ reloads from disk on Continue). Restores are verified with copy_and_verify
 (MD5 compare + retry).
 
 Usage (Windows, Python 3 installed):
-    python er_save_watcher.py [-g {er,dsr,ds3}] [-s SLOT] [save_dir]
+    python er_save_watcher.py [-g {er,dsr,ds3,ds2}] [-s SLOT] [save_dir]
 
     save_dir holds the save file; if omitted it's auto-detected (see
     GAME_PROFILES) when there's exactly one candidate subfolder.
@@ -131,6 +133,35 @@ DS3_NAME_MAX_LEN = 16  # characters (UTF-16, so this many *2 bytes per slot's na
 DS3_HEALTH_NAME_REL_OFFSET = -112  # CURRENT hp (drops to 0 on death), relative to the character name's position in the decrypted slot
 DS3_SOULS_NAME_REL_OFFSET = -20  # current (spendable) souls; -16 from the same anchor is SOULS MEMORY (avoid, see above)
 
+# ---- Dark Souls II: Scholar of the First Sin specifics -------------------
+
+# Also a BND4 container with AES-128-CBC entries (key from jtesta/souls_givifier), but laid out differently
+# from DSR/DS3 in two ways the rest of the code has to account for:
+#   1. The occupancy table AND per-slot names live in entry #0 (not entry #10), one record per slot
+#      DS2_SLOT_STRIDE bytes apart: an occupancy byte at DS2_OCCUPANCY_BYTE_BASE + DS2_SLOT_STRIDE*i and a
+#      UTF-16 name at DS2_NAME_BASE + DS2_SLOT_STRIDE*i (up to DS2_NAME_MAX_LEN chars).
+#   2. A character's actual save data is NOT in the same entry as its occupancy/name -- occupancy index i
+#      (0-9) maps to BND4 entry i+1, so the 10 characters occupy entries 1-10 and entry #0 is a header/menu
+#      entry. This is why DS2's active-character detection scans entries 1-10 (char_entries below) while the
+#      other games scan 0-9: DS2's entry #0 is rewritten on every save and would be a constant false positive.
+# Within a character entry, current souls is at DS2_SOULS_REL_OFFSET (fluctuates up/down as you earn/spend;
+# the +4/+8 ints next to it are SOUL MEMORY -- monotonic, never resets, same trap as DSR/DS3, avoid) and the
+# character's BASE max HP at DS2_HEALTH_REL_OFFSET. Souls was verified empirically against a live in-game
+# value. The HP field is the STORED BASE value and does NOT include the bonuses HP-boosting rings apply at
+# runtime, so it reads lower than the on-screen number when such a ring is worn (verified: stored 1054 shows
+# in-game as 1404 with a +HP ring, 1244 with another) -- it's logged for information only, not used for
+# anything. Crucially, DS2 death detection runs entirely on SOULS, not HP: DS2 only writes the save once you
+# respawn at a bonfire (always at full HP), so the saved HP never reads 0 the way it does in the other three
+# games -- it's souls dropping to 0 on death (until you recover your bloodstain) that signals it, exactly the
+# clean-state rule is_clean_state already enforces. Names/occupancy mirror ds2_get_slot_occupancy() in souls_givifier.
+DS2_AES_KEY = bytes.fromhex("599f9b699640a55236ee2d70835ec744")
+DS2_OCCUPANCY_BYTE_BASE = 892  # occupancy byte for slot 0 within decrypted entry #0
+DS2_NAME_BASE = 1286  # UTF-16 name for slot 0 within decrypted entry #0
+DS2_SLOT_STRIDE = 496  # bytes between consecutive slots' occupancy/name records
+DS2_NAME_MAX_LEN = 14  # characters (UTF-16)
+DS2_SOULS_REL_OFFSET = 60  # current (spendable) souls within a character entry; +4/+8 are SOUL MEMORY (avoid)
+DS2_HEALTH_REL_OFFSET = 72  # base max HP within a character entry (excludes runtime ring bonuses; informational only -- death detection uses souls)
+
 # ---- Per-game profiles ---------------------------------------------------
 
 
@@ -165,18 +196,35 @@ def _find_default_save_dir_ds3():
     return _find_default_subfolder_dir(os.path.join(appdata, "DarkSoulsIII")) if appdata else None
 
 
+def _find_default_save_dir_ds2():
+    """Dark Souls II: Scholar of the First Sin saves live at %APPDATA%\\DarkSoulsII\\<id>\\."""
+    appdata = os.environ.get("APPDATA")
+    return _find_default_subfolder_dir(os.path.join(appdata, "DarkSoulsII")) if appdata else None
+
+
+# char_entries = the BND4 entry indices that hold character data, used for active-character detection
+# (entry_fingerprints/changed_slot). er/dsr/ds3 store characters directly in entries 0-9; DS2 stores them in
+# entries 1-10 (its entry 0 is a header that's rewritten every save -- see the DS2 comment block above).
 GAME_PROFILES = {
     "er": {
         "save_filename": "ER0000.sl2",
         "find_default_save_dir": _find_default_save_dir_er,
+        "char_entries": range(10),
     },
     "dsr": {
         "save_filename": "DRAKS0005.sl2",
         "find_default_save_dir": _find_default_save_dir_dsr,
+        "char_entries": range(10),
     },
     "ds3": {
         "save_filename": "DS30000.sl2",
         "find_default_save_dir": _find_default_save_dir_ds3,
+        "char_entries": range(10),
+    },
+    "ds2": {
+        "save_filename": "DS2SOFS0000.sl2",
+        "find_default_save_dir": _find_default_save_dir_ds2,
+        "char_entries": range(1, 11),
     },
 }
 
@@ -282,14 +330,17 @@ def _bnd4_occupied_slots(raw, entries, aes_key, occupancy_rel_offset):
     return [i for i in range(10) if slot_bytes[i:i + 1] != b"\x00"]
 
 
-def entry_fingerprints(path):
+def entry_fingerprints(path, char_entries=range(10)):
     """
-    For active-character detection across all three games (all BND4): returns
-    {slot_index: checksum_bytes} for character entries 0-9, reading just the
-    16-byte per-slot checksum at each entry's data_offset (cheap -- no full
-    read or decryption). FromSoftware rewrites only the active character's
-    entry on save, so the slot whose checksum changes between two saves is the
-    one being played. Returns None on any failure.
+    For active-character detection across all four games (all BND4): returns
+    {entry_index: checksum_bytes} for the BND4 entries in char_entries, reading
+    just the 16-byte per-slot checksum at each entry's data_offset (cheap -- no
+    full read or decryption). FromSoftware rewrites only the active character's
+    entry on save, so the entry whose checksum changes between two saves is the
+    one being played. char_entries scopes which entries hold character data:
+    0-9 for er/dsr/ds3, but 1-10 for DS2 (whose entry 0 is a header rewritten
+    every save -- including it would be a constant false positive). Returns
+    None on any failure.
     """
     try:
         with open(path, "rb") as f:
@@ -298,7 +349,9 @@ def entry_fingerprints(path):
                 return None
             num_entries = struct.unpack_from("<i", header, 12)[0]
             out = {}
-            for i in range(min(num_entries, 10)):
+            for i in char_entries:
+                if i >= num_entries:
+                    continue
                 pos = DSR_BND4_HEADER_LEN + DSR_BND4_ENTRY_HEADER_LEN * i
                 data_offset = struct.unpack_from("<i", header, pos + 16)[0]
                 f.seek(data_offset)
@@ -416,6 +469,51 @@ def read_vitals_ds3(path, slot=None):
         return None, None
 
 
+def _ds2_occupied_entries(raw, entries):
+    """
+    DS2's entry #0 holds the occupancy table for the 10 character slots, one
+    byte per slot at DS2_OCCUPANCY_BYTE_BASE + DS2_SLOT_STRIDE*i. A non-zero
+    byte means slot i is occupied, and that character's save data lives in
+    BND4 entry i+1. Returns the list of occupied character ENTRY indices
+    (1-10), lowest first. Mirrors ds2_get_slot_occupancy() in souls_givifier.
+    """
+    size, data_offset = entries[0]
+    decrypted = _bnd4_decrypt_entry(raw, size, data_offset, DS2_AES_KEY)
+    occupied = []
+    for i in range(10):
+        if decrypted[DS2_OCCUPANCY_BYTE_BASE + DS2_SLOT_STRIDE * i] != 0:
+            occupied.append(i + 1)
+    return occupied
+
+
+def read_vitals_ds2(path, slot=None):
+    """Returns (health, souls) for the DS2 SOTFS save at path, or (None, None) on any read failure.
+    slot is the BND4 entry index of the active character (1-10); None (or one that isn't occupied)
+    falls back to the first occupied character entry. Unlike DSR/DS3, occupancy lives in entry #0 while
+    the character's data is in entry i+1 (see the DS2 comment block)."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None, None
+    try:
+        entries = _bnd4_parse_entries(raw)
+        occupied = _ds2_occupied_entries(raw, entries)
+        if not occupied:
+            return None, None
+        if slot is None or slot not in occupied:
+            slot = occupied[0]
+        size, data_offset = entries[slot]
+        decrypted = _bnd4_decrypt_entry(raw, size, data_offset, DS2_AES_KEY)
+        health = struct.unpack_from("<I", decrypted, DS2_HEALTH_REL_OFFSET)[0]
+        souls = struct.unpack_from("<I", decrypted, DS2_SOULS_REL_OFFSET)[0]
+        return health, souls
+    except (ValueError, struct.error, IndexError):
+        return None, None
+    except ImportError:
+        return None, None
+
+
 def is_clean_state(health, souls):
     """
     A snapshot/state is only trustworthy as a "good" checkpoint if the player
@@ -516,11 +614,12 @@ def load_or_init_kopie_baseline(save_dir, save_stem):
 class SaveWatcher:
     def __init__(self, path, save_stem, read_vitals_fn, on_change, on_snapshot, on_snapshot_failed,
                  on_death_restore, on_death_restore_failed, on_prune, on_prune_failed, on_active_slot,
-                 use_adaptive_rewind=False, slot_override=None):
+                 use_adaptive_rewind=False, slot_override=None, char_entries=range(10)):
         self.path = path
         self.save_dir = os.path.dirname(path)
         self.save_stem = save_stem
         self.read_vitals = read_vitals_fn
+        self.char_entries = char_entries
         self.on_change = on_change
         self.on_snapshot = on_snapshot
         self.on_snapshot_failed = on_snapshot_failed
@@ -554,14 +653,17 @@ class SaveWatcher:
             return
         kopies = list_numbered_kopies(self.save_dir, self.save_stem)
         if len(kopies) >= 2:
-            cand = changed_slot(entry_fingerprints(kopies[1][1]), entry_fingerprints(kopies[0][1]))
+            cand = changed_slot(
+                entry_fingerprints(kopies[1][1], self.char_entries),
+                entry_fingerprints(kopies[0][1], self.char_entries),
+            )
             if cand is not None:
                 self._active_slot = cand
 
     def _refresh_active_slot(self, path):
         if self.slot_override is not None:
             return
-        fingerprints = entry_fingerprints(path)
+        fingerprints = entry_fingerprints(path, self.char_entries)
         if fingerprints is None:
             return
         cand = changed_slot(self._prev_fingerprints, fingerprints)
@@ -906,7 +1008,7 @@ def main():
     save_stem = save_filename[:-len(".sl2")]
     save_file = os.path.join(args.save_dir, save_filename)
 
-    if args.game in ("dsr", "ds3"):
+    if args.game in ("dsr", "ds3", "ds2"):
         try:
             import cryptography  # noqa: F401
         except ImportError:
@@ -916,7 +1018,7 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(1)
-        read_vitals_fn = read_vitals_dsr if args.game == "dsr" else read_vitals_ds3
+        read_vitals_fn = {"dsr": read_vitals_dsr, "ds3": read_vitals_ds3, "ds2": read_vitals_ds2}[args.game]
     else:
         read_vitals_fn = read_vitals_er
 
@@ -969,7 +1071,7 @@ def main():
     watcher = SaveWatcher(
         save_file, save_stem, read_vitals_fn, on_change, on_snapshot, on_snapshot_failed,
         on_death_restore, on_death_restore_failed, on_prune, on_prune_failed, on_active_slot,
-        use_adaptive_rewind=False, slot_override=args.slot,
+        use_adaptive_rewind=False, slot_override=args.slot, char_entries=profile["char_entries"],
     )
     thread = threading.Thread(target=watcher.run, daemon=True)
     thread.start()
