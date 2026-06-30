@@ -2,92 +2,43 @@
 r"""
 Multi-Game .sl2 Save File Watcher + Auto-Restore + On-Screen Overlay.
 
-Watches a FromSoftware .sl2 save file, snapshots it into numbered
-"<stem> - Kopie (N).sl2" files whenever the state is "clean" (health > 0
-and souls > 0 -- see is_clean_state()), and can restore an earlier
-snapshot back over the live save. Pre-existing Kopie files and
-<stem>-backup.sl2 are never renamed, overwritten, or deleted.
+Watches a FromSoftware .sl2 save, snapshots it into numbered
+"<stem> - Kopie (N).sl2" files while the state is "clean" (health > 0 and
+souls > 0), and restores the latest clean snapshot after a death. Existing
+Kopie files are never modified or deleted -- only new ones are added, and
+only watcher-created snapshots beyond KOPIE_RETENTION_COUNT are pruned.
 
-Two games are supported (-g/--game): "er" (Elden Ring, ER0000.sl2) and
-"dsr" (Dark Souls Remastered, DRAKS0005.sl2). They use different save
-formats entirely -- see GAME_PROFILES below and the per-game read_vitals
-functions:
-- Elden Ring slots are unencrypted; health/souls are located by parsing
-  the save structurally (header, the variable-length ga_items array,
-  then PlayerGameData) rather than via a fixed offset, since item changes
-  shift everything after that array -- see _find_player_game_data_start()
-  and read_vitals_er(). Credit: offset/struct layout from
-  ClayAmore/ER-Save-Editor (PlayerGameData/GaItem definitions) and
-  Ariescyn/EldenRing-Save-Manager (slot/checksum layout).
-- Dark Souls Remastered slots are individually AES-128-CBC encrypted
-  (key below) inside a generic BND4 container -- see
-  _bnd4_parse_entries(), _dsr_decrypt_entry(), and read_vitals_dsr().
-  health/souls sit at fixed offsets once decrypted (no variable-length
-  array to walk, unlike Elden Ring), verified against two real characters
-  in this save -- including, critically, distinguishing CURRENT
-  (spendable) souls (offset 224) from lifetime SOULS MEMORY (offset 228,
-  monotonically non-decreasing, never resets on death/spending). An
-  earlier version of this code used 228 for death detection, which
-  appeared to verify correctly at first only because souls_memory hadn't
-  yet diverged from current souls in those checks -- it never actually
-  read 0 after a real death, so the restore never fired. Only the first
-  occupied character slot is tracked if more than one exists. Credit:
-  BND4 parsing and the AES key from jtesta/souls_givifier; the fixed
-  offsets were found empirically here (cross-checked against a documented
-  field table for original, unencrypted Dark Souls in tarvitz/dsfp, which
-  roughly but not exactly lines up -- DSR's internal layout has shifted
-  slightly since). Requires the third-party 'cryptography' package (pip
-  install cryptography) -- only imported when -g/--game dsr is actually
-  used, so Elden Ring users need no extra install.
+Games (-g/--game): er (Elden Ring, ER0000.sl2), dsr (Dark Souls
+Remastered, DRAKS0005.sl2), ds3 (Dark Souls III, DS30000.sl2). All three
+are BND4 containers; health/souls are read per game by read_vitals_er/
+dsr/ds3 (see those functions and the constants/comments above each for
+the format details and credits to the reverse-engineering projects we
+relied on). dsr/ds3 are AES-encrypted and need the 'cryptography' package
+(pip install cryptography); er is unencrypted and needs nothing extra.
 
-Restore path: if health/souls go unclean and stay that way for
-DEATH_RESTORE_DELAY_SECONDS, restores the latest clean snapshot. The
-delay matters because the game holds authoritative state in memory while
-running and can overwrite our restore with its own next autosave -- see
-_check_death()/_restore_after_death() for the full reasoning.
+Active-character detection: a .sl2 holds up to 10 characters but only the
+one being played is rewritten on save, so the active slot is the one whose
+BND4 entry checksum changes between saves (entry_fingerprints/changed_slot).
+Falls back to the first occupied slot until a save is observed; override
+with -s/--slot.
 
-DSR only (use_adaptive_rewind): if a death-restore is followed by another
-death within DEATH_RESTORE_ESCALATION_WINDOW_SECONDS, the snapshot that
-was just restored apparently wasn't actually safe (e.g. it captured you
-mid-fall off a cliff, not before the fall started) -- so the next restore
-skips one snapshot further back than last time, repeating until one
-sticks. It resets to the most recent clean snapshot once a restore goes
-unchallenged for that long, so an ordinary one-off death (e.g. mid-fight)
-loses minimal progress. Elden Ring does not use this -- it always
-restores the single most recent clean snapshot, unchanged from before.
-
-Every restore is verified via copy_and_verify() (MD5 compare + retry).
-Snapshots numbered higher than the baseline recorded in a per-game state
-file (the highest Kopie number that already existed the very first time
-the watcher ever ran here for that game) are considered "ours" and
-pruned oldest-first beyond KOPIE_RETENTION_COUNT (_prune_old_kopies());
-that baseline is persisted to disk specifically so pruning still works
-correctly across restarts -- an in-memory-only list would forget
-everything and need 30 fresh snapshots before pruning could resume each
-time the process restarts, which in practice is often (the watcher
-doesn't survive game restarts, crashes, or a PC reboot). Files at or
-below the baseline (manual backups predating the watcher) are never
-touched.
+Death-restore gate: a restore fires only once the save has been unclean
+AND quiet (not written) for DEATH_RESTORE_DELAY_SECONDS -- i.e. you've quit
+to the main menu. A restore made while the game is still running just gets
+overwritten by its next autosave; one made at the menu sticks (the game
+reloads from disk on Continue). Restores are verified with copy_and_verify
+(MD5 compare + retry).
 
 Usage (Windows, Python 3 installed):
-    python er_save_watcher.py [-g {er,dsr}] [save_dir]
+    python er_save_watcher.py [-g {er,dsr,ds3}] [-s SLOT] [save_dir]
 
-    save_dir is the folder containing the save file. If omitted, it's
-    auto-detected (see GAME_PROFILES' default_save_dir) as long as
-    there's exactly one candidate SteamID subfolder; otherwise required.
+    save_dir holds the save file; if omitted it's auto-detected (see
+    GAME_PROFILES) when there's exactly one candidate subfolder.
 
-Overlay limitations:
-    The overlay is a normal always-on-top desktop window. It will show up
-    fine over the game running in Borderless Windowed mode. True
-    exclusive Fullscreen mode in DirectX can paint over any external
-    topmost window -- that is a Windows/DirectX limitation no external
-    script can bypass. If the overlay does not appear over the game,
-    switch the game's display mode to Borderless/Windowed.
-
-Controls:
-    Drag the overlay's title bar to reposition it.
-    Click the "x" button to close the overlay (the watcher and its log
-    keep running until the process exits).
+The overlay is always-on-top and works over Borderless Windowed mode (true
+exclusive Fullscreen can paint over it -- a Windows/DirectX limitation).
+Drag its title bar to move it; click "x" to close it (the watcher keeps
+running). A full log is written to save_changes.log next to the program.
 """
 
 import argparse
@@ -124,7 +75,11 @@ ENABLE_DEATH_RESTORE = True
 
 # ---- Elden Ring specifics ----------------------------------------------
 
-ER_SLOT0_DATA_START = 0x310
+# ER's .sl2 is a BND4 container too (just unencrypted), so per-character slots are reachable the same way as
+# DSR/DS3: a slot's data begins ER_ENTRY_DATA_SKIP bytes into its BND4 entry's data_offset (entry[0] is at
+# 0x300, so slot 0 data is at 0x310 -- which matches the old hardcoded constant). The 16-byte skip is the
+# per-slot checksum region (the same place the encrypted games put their AES IV).
+ER_ENTRY_DATA_SKIP = 16
 ER_GA_ITEM_COUNT = 0x1400  # number of GaItem slots preceding PlayerGameData, per ER-Save-Editor's SaveSlot::read()
 ER_HEALTH_REL_OFFSET = 8  # byte offset of `health` within PlayerGameData, per its struct field order
 ER_SOULS_REL_OFFSET = 100  # byte offset of `souls` (= runes) within PlayerGameData, per its struct field order
@@ -136,6 +91,7 @@ DSR_AES_KEY = bytes.fromhex("0123456789abcdeffedcba9876543210")
 DSR_BND4_HEADER_LEN = 64
 DSR_BND4_ENTRY_HEADER_LEN = 32
 DSR_BND4_ENTRY_MAGIC = b"\x50\x00\x00\x00\xff\xff\xff\xff"
+DSR_OCCUPANCY_REL_OFFSET = 176  # occupancy byte table within decrypted entry #10
 DSR_HEALTH_REL_OFFSET = 96  # verified against two real characters' current/max HP
 DSR_SOULS_REL_OFFSET = 224  # current (spendable) souls -- verified against a live in-game value of 8000.
 DSR_SOULS_MEMORY_REL_OFFSET = 228  # lifetime cumulative souls; monotonically non-decreasing, never resets on death/spending.
@@ -144,14 +100,48 @@ DSR_SOULS_MEMORY_REL_OFFSET = 228  # lifetime cumulative souls; monotonically no
 # actually spend or lose some, which hadn't happened yet in those earlier checks. Using souls_memory for death
 # detection meant souls never read 0 after a death (it only ever grows), so the restore never fired.
 
+# ---- Dark Souls III specifics --------------------------------------------
+
+# Same BND4 container/entry constants as DSR (DSR_BND4_HEADER_LEN etc. are reused directly -- this is a
+# generic FromSoftware container format, not DSR-specific), but its own AES key and occupancy-table offset.
+# Credit: AES key from jtesta/souls_givifier (cross-checked against alfizari/Dark-Souls-3-Save-Editor-PS4-PC).
+#
+# An earlier version of this code computed health/souls via alfizari's gaprint()/Item.from_bytes() item-array-
+# walk technique (offsets relative to the end of that array). That walk had a small but real drift (~4 bytes,
+# likely because this game version's empty item slots are marked 0xFFFFFFFF rather than the 0x00000000 the
+# reference assumed) which silently shifted every downstream field over by one: what it reported as "health"
+# was actually FP, and "souls" was actually the never-resetting SOULS MEMORY field -- the exact same category
+# of bug DSR hit earlier with its own souls/souls_memory mixup, caught here only because a live in-game value
+# (souls=0 right after death) didn't match what was being read. Switched instead to the technique
+# souls_givifier.py itself uses for DS3: locate the character's name (auto-extracted from entry #10's
+# occupancy table, not user-supplied) within the decrypted character slot, then read fixed distances from
+# THAT position -- see read_vitals_ds3(). Verified empirically against a live character (matched the in-game
+# HP=550 and souls=700 exactly).
+#
+# Health is a 3-int cluster [current, max, base] at name_pos -112/-108/-104 (same order as Elden Ring's
+# PlayerGameData). We read CURRENT at -112 (the one that drops to 0 on death); -104 (base max HP) was used
+# at first and is wrong for death detection -- it never goes to 0. (A live full-HP/rested character reads all
+# three equal, e.g. 550/550/550, which is why the distinction wasn't obvious until checked against a damaged
+# state.) FP and Stamina follow as their own triplets just after.
+DS3_AES_KEY = bytes.fromhex("fd464d695e69a39a10e319a7ace8b7fa")
+DS3_OCCUPANCY_REL_OFFSET = 4244  # occupancy byte table within decrypted entry #10
+DS3_NAME_TABLE_REL_OFFSET = 4254  # start of the per-slot name table within decrypted entry #10, right after the occupancy bytes
+DS3_NAME_TABLE_STRIDE = 554  # bytes per slot within that name table
+DS3_NAME_MAX_LEN = 16  # characters (UTF-16, so this many *2 bytes per slot's name field)
+DS3_HEALTH_NAME_REL_OFFSET = -112  # CURRENT hp (drops to 0 on death), relative to the character name's position in the decrypted slot
+DS3_SOULS_NAME_REL_OFFSET = -20  # current (spendable) souls; -16 from the same anchor is SOULS MEMORY (avoid, see above)
+
 # ---- Per-game profiles ---------------------------------------------------
 
 
 def _find_default_subfolder_dir(base):
-    """Shared helper: returns base/<the one digit-named subfolder>, or None if there's zero or more than one."""
+    """Shared helper: returns base/<the one hex-or-digit-named subfolder>, or None if there's zero or more than one."""
     if not os.path.isdir(base):
         return None
-    candidates = [d for d in os.listdir(base) if d.isdigit() and os.path.isdir(os.path.join(base, d))]
+    candidates = [
+        d for d in os.listdir(base)
+        if d and all(c in "0123456789abcdefABCDEF" for c in d) and os.path.isdir(os.path.join(base, d))
+    ]
     if len(candidates) == 1:
         return os.path.join(base, candidates[0])
     return None
@@ -169,6 +159,12 @@ def _find_default_save_dir_dsr():
     return _find_default_subfolder_dir(os.path.join(documents, "NBGI", "DARK SOULS REMASTERED"))
 
 
+def _find_default_save_dir_ds3():
+    """Dark Souls III saves live at %APPDATA%\\DarkSoulsIII\\<id>\\ (not always a plain decimal SteamID64)."""
+    appdata = os.environ.get("APPDATA")
+    return _find_default_subfolder_dir(os.path.join(appdata, "DarkSoulsIII")) if appdata else None
+
+
 GAME_PROFILES = {
     "er": {
         "save_filename": "ER0000.sl2",
@@ -177,6 +173,10 @@ GAME_PROFILES = {
     "dsr": {
         "save_filename": "DRAKS0005.sl2",
         "find_default_save_dir": _find_default_save_dir_dsr,
+    },
+    "ds3": {
+        "save_filename": "DS30000.sl2",
+        "find_default_save_dir": _find_default_save_dir_ds3,
     },
 }
 
@@ -200,11 +200,24 @@ def _find_player_game_data_start(buf):
     return pos
 
 
-def read_vitals_er(path):
-    """Returns (health, souls) for the Elden Ring save at path, or (None, None) on any read failure."""
+def read_vitals_er(path, slot=None):
+    """
+    Returns (health, souls) for the Elden Ring save at path, or (None, None) on
+    any read failure. slot None defaults to 0 (ER's occupancy table offset isn't
+    reverse-engineered here, so we can't list occupied slots -- but active-slot
+    detection picks the right one once a save is observed regardless). Reads only
+    the BND4 header plus a 256KB window from the chosen slot, not the whole ~29MB.
+    """
+    if slot is None:
+        slot = 0
     try:
         with open(path, "rb") as f:
-            f.seek(ER_SLOT0_DATA_START)
+            header = f.read(DSR_BND4_HEADER_LEN + DSR_BND4_ENTRY_HEADER_LEN * 16)
+            if header[0:4] != b"BND4":
+                return None, None
+            pos = DSR_BND4_HEADER_LEN + DSR_BND4_ENTRY_HEADER_LEN * slot
+            data_offset = struct.unpack_from("<i", header, pos + 16)[0]
+            f.seek(data_offset + ER_ENTRY_DATA_SKIP)
             buf = f.read(ER_READ_PREFIX_SIZE)
     except OSError:
         return None, None
@@ -240,41 +253,77 @@ def _bnd4_parse_entries(raw):
     return entries
 
 
-def _dsr_decrypt_entry(raw, size, data_offset):
+def _bnd4_decrypt_entry(raw, size, data_offset, aes_key):
     """
-    Decrypts one DSR BND4 entry with AES-128-CBC (key is published/well-known,
+    Decrypts one BND4 entry with AES-128-CBC (key is published/well-known,
     not a secret -- see jtesta/souls_givifier). The IV is the first 16 bytes
     at data_offset; the true (unpadded) length is a 4-byte int right after
     decryption starts, followed by that many bytes of actual save data.
     """
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # imported lazily: optional dep, only needed for DSR
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # imported lazily: optional dep, only needed for encrypted-save games
 
     iv = raw[data_offset + 16:data_offset + 32]
     encrypted = raw[data_offset + 16:data_offset + size]
-    decryptor = Cipher(algorithms.AES128(DSR_AES_KEY), modes.CBC(iv)).decryptor()
+    decryptor = Cipher(algorithms.AES128(aes_key), modes.CBC(iv)).decryptor()
     decrypted = decryptor.update(encrypted) + decryptor.finalize()
     data_len = struct.unpack_from("<i", decrypted, 16)[0]
     return decrypted[20:20 + data_len]
 
 
-def _dsr_find_first_occupied_slot(raw, entries):
+def _bnd4_occupied_slots(raw, entries, aes_key, occupancy_rel_offset):
     """
-    Entry #10 (the 11th) holds an occupancy table for the 10 character slots.
-    Returns the lowest occupied slot index, or None if none are occupied.
-    Only the first one is ever tracked -- if you play multiple DSR
-    characters in the same save, only the lowest-numbered slot is watched.
+    Entry #10 (the 11th) holds an occupancy table for the 10 character slots,
+    one byte each, starting at occupancy_rel_offset within its decrypted data.
+    Returns the list of occupied slot indices, lowest first.
     """
     size, data_offset = entries[10]
-    occupancy_data = _dsr_decrypt_entry(raw, size, data_offset)
-    slot_bytes = occupancy_data[176:186]
-    for i in range(10):
-        if slot_bytes[i:i + 1] != b"\x00":
-            return i
-    return None
+    occupancy_data = _bnd4_decrypt_entry(raw, size, data_offset, aes_key)
+    slot_bytes = occupancy_data[occupancy_rel_offset:occupancy_rel_offset + 10]
+    return [i for i in range(10) if slot_bytes[i:i + 1] != b"\x00"]
 
 
-def read_vitals_dsr(path):
-    """Returns (health, souls) for the DSR save at path, or (None, None) on any read failure."""
+def entry_fingerprints(path):
+    """
+    For active-character detection across all three games (all BND4): returns
+    {slot_index: checksum_bytes} for character entries 0-9, reading just the
+    16-byte per-slot checksum at each entry's data_offset (cheap -- no full
+    read or decryption). FromSoftware rewrites only the active character's
+    entry on save, so the slot whose checksum changes between two saves is the
+    one being played. Returns None on any failure.
+    """
+    try:
+        with open(path, "rb") as f:
+            header = f.read(DSR_BND4_HEADER_LEN + DSR_BND4_ENTRY_HEADER_LEN * 16)
+            if header[0:4] != b"BND4":
+                return None
+            num_entries = struct.unpack_from("<i", header, 12)[0]
+            out = {}
+            for i in range(min(num_entries, 10)):
+                pos = DSR_BND4_HEADER_LEN + DSR_BND4_ENTRY_HEADER_LEN * i
+                data_offset = struct.unpack_from("<i", header, pos + 16)[0]
+                f.seek(data_offset)
+                out[i] = f.read(16)
+            return out
+    except (OSError, struct.error):
+        return None
+
+
+def changed_slot(prev_fp, new_fp):
+    """
+    Given two {slot: checksum} maps, returns the single slot whose checksum
+    changed (the active character on that save), or None if zero slots, more
+    than one slot, or either map is missing changed -- only a lone change is
+    unambiguous enough to act on.
+    """
+    if not prev_fp or not new_fp:
+        return None
+    changed = [s for s in new_fp if s in prev_fp and prev_fp[s] != new_fp[s]]
+    return changed[0] if len(changed) == 1 else None
+
+
+def read_vitals_dsr(path, slot=None):
+    """Returns (health, souls) for the DSR save at path, or (None, None) on any read failure.
+    slot None (or a slot that isn't occupied) falls back to the first occupied slot."""
     try:
         with open(path, "rb") as f:
             raw = f.read()
@@ -282,15 +331,86 @@ def read_vitals_dsr(path):
         return None, None
     try:
         entries = _bnd4_parse_entries(raw)
-        slot = _dsr_find_first_occupied_slot(raw, entries)
-        if slot is None:
+        occupied = _bnd4_occupied_slots(raw, entries, DSR_AES_KEY, DSR_OCCUPANCY_REL_OFFSET)
+        if not occupied:
             return None, None
+        if slot is None or slot not in occupied:
+            slot = occupied[0]
         size, data_offset = entries[slot]
-        decrypted = _dsr_decrypt_entry(raw, size, data_offset)
+        decrypted = _bnd4_decrypt_entry(raw, size, data_offset, DSR_AES_KEY)
         health = struct.unpack_from("<I", decrypted, DSR_HEALTH_REL_OFFSET)[0]
         souls = struct.unpack_from("<I", decrypted, DSR_SOULS_REL_OFFSET)[0]
         return health, souls
     except (ValueError, struct.error):
+        return None, None
+    except ImportError:
+        return None, None
+
+
+def _ds3_occupied_slots_and_names(raw, entries):
+    """
+    Entry #10 holds both the occupancy table (one byte per slot, at
+    DS3_OCCUPANCY_REL_OFFSET) and a compact per-slot name table right after
+    it (DS3_NAME_TABLE_REL_OFFSET, DS3_NAME_TABLE_STRIDE bytes apart, each a
+    UTF-16 string up to DS3_NAME_MAX_LEN characters, null-terminated).
+    Returns {slot_index: name} for every occupied slot.
+    Mirrors unified_get_slot_occupancy() in jtesta/souls_givifier.
+    """
+    size, data_offset = entries[10]
+    decrypted = _bnd4_decrypt_entry(raw, size, data_offset, DS3_AES_KEY)
+    slot_bytes = decrypted[DS3_OCCUPANCY_REL_OFFSET:DS3_OCCUPANCY_REL_OFFSET + 10]
+    out = {}
+    for i in range(10):
+        if slot_bytes[i:i + 1] == b"\x00":
+            continue
+        name_offset = DS3_NAME_TABLE_REL_OFFSET + DS3_NAME_TABLE_STRIDE * i
+        name_bytes = decrypted[name_offset:name_offset + DS3_NAME_MAX_LEN * 2]
+        null_pos = name_bytes.find(b"\x00\x00")
+        if null_pos != -1:
+            name_bytes = name_bytes[:null_pos + 1]
+        out[i] = name_bytes.decode("utf-16")
+    return out
+
+
+def _ds3_encode_name(name):
+    """
+    Re-encodes a character name the way it appears in decrypted DS3 slot
+    data: one null byte after each ASCII character (NOT real UTF-16 --
+    Python's utf-16 encoder inserts a BOM and doesn't match). Mirrors
+    encode_char_name() in jtesta/souls_givifier. Names with non-ASCII
+    characters won't be found this way -- a known limitation upstream too.
+    """
+    out = b""
+    for ch in name:
+        out += ch.encode("ascii") + b"\x00"
+    return out
+
+
+def read_vitals_ds3(path, slot=None):
+    """Returns (health, souls) for the DS3 save at path, or (None, None) on any read failure.
+    slot None (or a slot that isn't occupied) falls back to the first occupied slot."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None, None
+    try:
+        entries = _bnd4_parse_entries(raw)
+        names = _ds3_occupied_slots_and_names(raw, entries)
+        if not names:
+            return None, None
+        if slot is None or slot not in names:
+            slot = min(names)
+        name = names[slot]
+        size, data_offset = entries[slot]
+        decrypted = _bnd4_decrypt_entry(raw, size, data_offset, DS3_AES_KEY)
+        name_pos = decrypted.find(_ds3_encode_name(name))
+        if name_pos == -1:
+            return None, None
+        health = struct.unpack_from("<I", decrypted, name_pos + DS3_HEALTH_NAME_REL_OFFSET)[0]
+        souls = struct.unpack_from("<I", decrypted, name_pos + DS3_SOULS_NAME_REL_OFFSET)[0]
+        return health, souls
+    except (ValueError, struct.error, UnicodeDecodeError, UnicodeEncodeError):
         return None, None
     except ImportError:
         return None, None
@@ -395,8 +515,8 @@ def load_or_init_kopie_baseline(save_dir, save_stem):
 
 class SaveWatcher:
     def __init__(self, path, save_stem, read_vitals_fn, on_change, on_snapshot, on_snapshot_failed,
-                 on_death_restore, on_death_restore_failed, on_prune, on_prune_failed,
-                 use_adaptive_rewind=False):
+                 on_death_restore, on_death_restore_failed, on_prune, on_prune_failed, on_active_slot,
+                 use_adaptive_rewind=False, slot_override=None):
         self.path = path
         self.save_dir = os.path.dirname(path)
         self.save_stem = save_stem
@@ -408,16 +528,50 @@ class SaveWatcher:
         self.on_death_restore_failed = on_death_restore_failed
         self.on_prune = on_prune
         self.on_prune_failed = on_prune_failed
+        self.on_active_slot = on_active_slot
         self.use_adaptive_rewind = use_adaptive_rewind
+        self.slot_override = slot_override
         self._last_size = None
         self._last_mtime = None
         self._last_hash = None
         self._death_restore_pending = False
-        self._death_detected_monotonic = None
         self._death_restore_skip = 0  # adaptive rewind only: how many extra clean snapshots back to skip
         self._last_death_restore_monotonic = None  # adaptive rewind only: when the last death-restore happened
         self._kopie_baseline = load_or_init_kopie_baseline(self.save_dir, self.save_stem)
+        # Which character slot to read vitals from. These games store up to 10 characters in one .sl2; only
+        # the one being played is rewritten on save, so we detect it by which BND4 entry's checksum changes
+        # (see entry_fingerprints/changed_slot). None until determined -> read_vitals falls back to the first
+        # occupied slot. A fixed slot_override (CLI) disables auto-detection.
+        self._active_slot = slot_override
+        self._prev_fingerprints = None
+        self._bootstrap_active_slot()
         self._stop = threading.Event()
+
+    def _bootstrap_active_slot(self):
+        # Determine the active slot up front (so the very first reads are correct) by diffing the two most
+        # recent snapshots -- two consecutive saves of the active character differ only in that slot.
+        if self.slot_override is not None:
+            return
+        kopies = list_numbered_kopies(self.save_dir, self.save_stem)
+        if len(kopies) >= 2:
+            cand = changed_slot(entry_fingerprints(kopies[1][1]), entry_fingerprints(kopies[0][1]))
+            if cand is not None:
+                self._active_slot = cand
+
+    def _refresh_active_slot(self, path):
+        if self.slot_override is not None:
+            return
+        fingerprints = entry_fingerprints(path)
+        if fingerprints is None:
+            return
+        cand = changed_slot(self._prev_fingerprints, fingerprints)
+        if cand is not None and cand != self._active_slot:
+            self._active_slot = cand
+            self.on_active_slot(cand)
+        self._prev_fingerprints = fingerprints
+
+    def _read_vitals(self, path):
+        return self.read_vitals(path, self._active_slot)
 
     def _hash_file(self, path):
         h = hashlib.sha256()
@@ -443,7 +597,8 @@ class SaveWatcher:
             return
         delta = None if self._last_size is None else size - self._last_size
         self._last_size, self._last_mtime, self._last_hash = size, mtime, digest
-        health, souls = self.read_vitals(self.path)
+        self._refresh_active_slot(self.path)  # re-detect active character before reading its vitals
+        health, souls = self._read_vitals(self.path)
         self.on_change(size, delta, digest[:12], health, souls)
         if delta is None:  # don't snapshot the initial baseline read, only real changes
             return
@@ -451,20 +606,27 @@ class SaveWatcher:
             self._snapshot_change()
 
     def _check_death(self):
-        health, souls = self.read_vitals(self.path)
+        # Only restore once the save file has been UNCLEAN *and* quiet -- not written for
+        # DEATH_RESTORE_DELAY_SECONDS. The quiet part is key: while you're still playing after a death the game
+        # keeps rewriting the save with the (still-unclean) live state every few seconds, and any restore we
+        # made would be instantly overwritten. The file only goes quiet once you've quit to the main menu, and
+        # a restore done then sticks (the game reloads from disk on Continue). We read the file's actual mtime
+        # each check (rather than a timer maintained elsewhere) so this is immune to poll-ordering races -- and
+        # since our own restore write bumps the mtime, it also can't immediately re-fire on its own restore.
+        try:
+            seconds_since_write = time.time() - os.path.getmtime(self.path)
+        except OSError:
+            return
+        health, souls = self._read_vitals(self.path)
         if health is None or souls is None:
             return
         if is_clean_state(health, souls):
             self._death_restore_pending = False
-            self._death_detected_monotonic = None
             return
         if self._death_restore_pending:
             return  # already attempted a restore for this unclean episode; wait for it to clear
-        if self._death_detected_monotonic is None:
-            self._death_detected_monotonic = time.monotonic()
-            return  # unclean state just observed; wait out DEATH_RESTORE_DELAY_SECONDS before acting
-        if time.monotonic() - self._death_detected_monotonic < DEATH_RESTORE_DELAY_SECONDS:
-            return  # still within the delay window; re-checked (and re-armed above) every tick
+        if seconds_since_write < DEATH_RESTORE_DELAY_SECONDS:
+            return  # file written recently (you're still playing) -- wait for it to go quiet (main menu)
         self._death_restore_pending = True
         self._restore_after_death(health, souls)
 
@@ -507,7 +669,7 @@ class SaveWatcher:
             return
         clean_candidates = []  # newest first; only ones that are a clean (alive + souls reclaimed) state
         for _, candidate in kopies:
-            health, souls = self.read_vitals(candidate)
+            health, souls = self._read_vitals(candidate)
             if health is not None and souls is not None and health != 0 and souls != 0:
                 clean_candidates.append(candidate)
         if not clean_candidates:
@@ -609,6 +771,13 @@ def log_death_restore_failed(reason):
     line = f"[{timestamp}] DEATH DETECTED but RESTORE FAILED: {reason}"
     _write_log(line)
     return f"{timestamp}  DIED but restore failed: {reason}"
+
+
+def log_active_slot(slot):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] tracking active character slot {slot}"
+    _write_log(line)
+    return f"{timestamp}  active character: slot {slot}"
 
 
 def play_snapshot_sound():
@@ -714,6 +883,12 @@ def parse_args():
              + (f" (default, auto-detected: {auto_detected})" if auto_detected else
                 " (required: couldn't auto-detect a unique save folder for this game)"),
     )
+    parser.add_argument(
+        "-s", "--slot", type=int, default=None,
+        help="Force a specific character slot (0-9) instead of auto-detecting the active one. "
+             "Normally unnecessary -- the watcher detects which character is being played by which "
+             "save slot changes -- but useful to override if detection picks wrong.",
+    )
     args = parser.parse_args()
     if args.save_dir is None:
         parser.error(
@@ -731,17 +906,17 @@ def main():
     save_stem = save_filename[:-len(".sl2")]
     save_file = os.path.join(args.save_dir, save_filename)
 
-    if args.game == "dsr":
+    if args.game in ("dsr", "ds3"):
         try:
             import cryptography  # noqa: F401
         except ImportError:
             print(
-                "ERROR: DSR support requires the 'cryptography' package, which isn't installed.\n"
+                f"ERROR: {args.game} support requires the 'cryptography' package, which isn't installed.\n"
                 "Install it with:  pip install cryptography",
                 file=sys.stderr,
             )
             sys.exit(1)
-        read_vitals_fn = read_vitals_dsr
+        read_vitals_fn = read_vitals_dsr if args.game == "dsr" else read_vitals_ds3
     else:
         read_vitals_fn = read_vitals_er
 
@@ -786,10 +961,15 @@ def main():
         with pending_lock:
             pending.append(line)
 
+    def on_active_slot(slot):
+        line = log_active_slot(slot)
+        with pending_lock:
+            pending.append(line)
+
     watcher = SaveWatcher(
         save_file, save_stem, read_vitals_fn, on_change, on_snapshot, on_snapshot_failed,
-        on_death_restore, on_death_restore_failed, on_prune, on_prune_failed,
-        use_adaptive_rewind=(args.game == "dsr"),
+        on_death_restore, on_death_restore_failed, on_prune, on_prune_failed, on_active_slot,
+        use_adaptive_rewind=False, slot_override=args.slot,
     )
     thread = threading.Thread(target=watcher.run, daemon=True)
     thread.start()
