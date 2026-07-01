@@ -1,6 +1,6 @@
 # .sl2 Save Watcher
 
-A little Windows tool that watches your Elden Ring, Dark Souls Remastered, Dark Souls III, or Dark Souls II: Scholar of the First Sin save file while you play, and after you die, automatically restores your last good checkpoint — all without you having to manually copy files around.
+A little Windows tool that watches your Elden Ring, Dark Souls Remastered, Dark Souls III, or Dark Souls II: Scholar of the First Sin save file while you play, and after you die, automatically restores your last good checkpoint with acoustic notification. This way you continue where you died and you save a lot of time because you don't need to run to the place you died to pickup your runes!
 
 ## Supported games
 
