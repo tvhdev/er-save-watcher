@@ -78,7 +78,18 @@ pip install pyinstaller
 pyinstaller --onefile --windowed --name ER_Save_Watcher er_save_watcher.py
 ```
 
-The result lands in `dist\ER_Save_Watcher.exe`.
+The result lands in `dist\ER_Save_Watcher.exe`. The exe is fully self-contained — it bundles Python, tkinter, and `cryptography`, so the machine that *runs* it needs none of them installed.
+
+#### Building the .exe from Linux/macOS (Docker)
+
+You don't need a Windows machine to build the Windows exe. The included `Dockerfile` cross-builds it using a Windows Python running under Wine (`tobix/pywine`) plus PyInstaller — everything (Python, tkinter, `cryptography`) still ends up bundled inside the single exe.
+
+```
+docker build -t ersavewatcher-build .
+docker run --rm -v "$(pwd)/dist:/out" ersavewatcher-build
+```
+
+The first command builds the exe into the image; the second copies it out to `dist/ER_Save_Watcher.exe` on your host (the container copies it into whatever directory you mount at `/out`). The exe ends up owned by `root` because the container writes it — `sudo chown $USER dist/ER_Save_Watcher.exe` if that's inconvenient.
 
 ## Known limitations
 
