@@ -13,6 +13,14 @@ A little Windows tool that watches your Elden Ring, Dark Souls Remastered, Dark 
 
 These use completely different save formats under the hood (Elden Ring's is unencrypted; DSR's, DS3's, and DS2's are AES-128-CBC encrypted per character slot, each with its own key), but the tool behaves the same way from the outside regardless of which one you pick. DSR, DS3, and DS2 additionally need the `cryptography` Python package installed (see Running it below) — Elden Ring needs nothing extra.
 
+## What to do after you die
+
+1. Die as normal and let the death animation play out.
+2. From the death screen, go back to the **main menu** instead of continuing to play — don't keep playing on the spot, since the game can overwrite the restore again while you're actively still in the session.
+3. Wait. The tool needs your health/runes (or souls, for DSR) to stay in an "unclean" state for a little while before it acts, so the restore doesn't happen instantly.
+4. Listen for the **two-tone restore sound**. That's your signal that the last good checkpoint has been copied back over your save.
+5. Only now click **Continue**. Loading before the sound plays means you'd load the version of the save before the restore happened.
+
 ## What it actually does
 
 - **Watches** your save file and notices every time the game writes to it.
@@ -23,14 +31,6 @@ These use completely different save formats under the hood (Elden Ring's is unen
 - **Cleans up after itself**: keeps the most recent 30 snapshots it created and deletes older ones automatically, so it doesn't quietly fill your disk. It never touches files that were already there before it started (including any manual backups you made yourself).
 - **Shows a small on-screen overlay** with what it's been doing, and writes a full log (including live health/souls readings, for debugging) to `save_changes.log` next to the program.
 - **Plays two different sounds** so you can tell what just happened without looking at the overlay: a short single beep when a new snapshot is taken, and a longer two-tone beep when a checkpoint has actually been restored.
-
-## What to do after you die
-
-1. Die as normal and let the death animation play out.
-2. From the death screen, go back to the **main menu** instead of continuing to play — don't keep playing on the spot, since the game can overwrite the restore again while you're actively still in the session.
-3. Wait. The tool needs your health/runes (or souls, for DSR) to stay in an "unclean" state for a little while before it acts, so the restore doesn't happen instantly.
-4. Listen for the **two-tone restore sound**. That's your signal that the last good checkpoint has been copied back over your save.
-5. Only now click **Continue**. Loading before the sound plays means you'd load the version of the save before the restore happened.
 
 ## Running it
 
