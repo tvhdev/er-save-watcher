@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 r"""
-Multi-Game .sl2 Save File Watcher + Auto-Restore + On-Screen Overlay.
+Multi-Game .sl2 / .sav Save File Watcher + Auto-Restore + On-Screen Overlay.
 
-Watches a FromSoftware .sl2 save, snapshots it into numbered
-"<stem> - Kopie (N).sl2" files while the state is "clean" (health > 0 and
-souls > 0), and restores the latest clean snapshot after a death. Existing
-Kopie files are never modified or deleted -- only new ones are added, and
-only watcher-created snapshots beyond KOPIE_RETENTION_COUNT are pruned.
+Watches a game save, snapshots it into numbered "<stem> - Kopie (N)<ext>"
+files while the state is "clean" (health > 0 and the currency > 0), and
+restores the latest clean snapshot after a death. Existing Kopie files are
+never modified or deleted -- only new ones are added, and only watcher-
+created snapshots beyond KOPIE_RETENTION_COUNT are pruned.
 
-Games (-g/--game): er (Elden Ring, ER0000.sl2), dsr (Dark Souls
-Remastered, DRAKS0005.sl2), ds3 (Dark Souls III, DS30000.sl2), ds2 (Dark
-Souls II: Scholar of the First Sin, DS2SOFS0000.sl2). All four are BND4
-containers; health/souls are read per game by read_vitals_er/dsr/ds3/ds2
-(see those functions and the constants/comments above each for the format
-details and credits to the reverse-engineering projects we relied on).
-dsr/ds3/ds2 are AES-encrypted and need the 'cryptography' package (pip
-install cryptography); er is unencrypted and needs nothing extra.
+Games (-g/--game): er (Elden Ring, ER0000.sl2), dsr (Dark Souls Remastered,
+DRAKS0005.sl2), ds3 (Dark Souls III, DS30000.sl2), ds2 (Dark Souls II:
+Scholar of the First Sin, DS2SOFS0000.sl2), lop (Lies of P, .sav). The four
+FromSoftware games are BND4 .sl2 containers read by read_vitals_er/dsr/ds3/
+ds2; dsr/ds3/ds2 are AES-encrypted and need the 'cryptography' package (pip
+install cryptography), er is unencrypted. lop is an Unreal Engine GVAS .sav
+(read by read_vitals_lop, no extra deps) -- its currency is "Ergo"; see the
+LOP_* constants block. See each read_vitals_* and the constants above it for
+format details and credits to the reverse-engineering projects relied on.
 
-Active-character detection: a .sl2 holds up to 10 characters but only the
-one being played is rewritten on save, so the active slot is the BND4 entry
-whose checksum changes between saves (entry_fingerprints/changed_slot). The
-character entries are 0-9 for er/dsr/ds3 but 1-10 for ds2 (its entry 0 is a
-header rewritten every save); see GAME_PROFILES' char_entries. Falls back to
-the first occupied slot until a save is observed; override with -s/--slot.
+Active-character detection (BND4 games only): a .sl2 holds up to 10
+characters but only the one being played is rewritten on save, so the active
+slot is the BND4 entry whose checksum changes between saves (entry_
+fingerprints/changed_slot). The character entries are 0-9 for er/dsr/ds3 but
+1-10 for ds2 (its entry 0 is a header rewritten every save); see
+GAME_PROFILES' char_entries. Falls back to the first occupied slot until a
+save is observed; override with -s/--slot. lop isn't a BND4 container, so
+this no-ops for it; instead it auto-picks the most-recently-written
+SaveData-*_Character_*.sav in the folder at startup (resolve_save_filename).
 
 Death-restore gate: a restore fires only once the save has been unclean
 AND quiet (not written) for DEATH_RESTORE_DELAY_SECONDS -- i.e. you've quit
@@ -32,10 +36,12 @@ reloads from disk on Continue). Restores are verified with copy_and_verify
 (MD5 compare + retry).
 
 Usage (Windows, Python 3 installed):
-    python er_save_watcher.py [-g {er,dsr,ds3,ds2}] [-s SLOT] [save_dir]
+    python er_save_watcher.py -g {er,dsr,ds3,ds2,lop} [-s SLOT] [save_dir]
 
-    save_dir holds the save file; if omitted it's auto-detected (see
-    GAME_PROFILES) when there's exactly one candidate subfolder.
+    Launched with no arguments (e.g. the exe double-clicked), it prints/shows
+    a short help and exits. save_dir holds the save file; for the BND4 games
+    it's auto-detected (see GAME_PROFILES) when there's exactly one candidate
+    subfolder, but for lop you pass the SaveGames\<id> folder explicitly.
 
 The overlay is always-on-top and works over Borderless Windowed mode (true
 exclusive Fullscreen can paint over it -- a Windows/DirectX limitation).
@@ -162,6 +168,37 @@ DS2_NAME_MAX_LEN = 14  # characters (UTF-16)
 DS2_SOULS_REL_OFFSET = 60  # current (spendable) souls within a character entry; +4/+8 are SOUL MEMORY (avoid)
 DS2_HEALTH_REL_OFFSET = 72  # base max HP within a character entry (excludes runtime ring bonuses; informational only -- death detection uses souls)
 
+# ---- Lies of P specifics -------------------------------------------------
+
+# Lies of P is an Unreal Engine game, so its saves are a completely different animal from the four
+# FromSoftware games above: not a BND4 .sl2 container but an uncompressed GVAS blob (magic 'GVAS') with
+# human-readable UE property names. There are no per-character BND4 slots, so the active-slot detection
+# simply doesn't apply -- entry_fingerprints() returns None on a non-BND4 file and detection no-ops.
+# DEATH SIGNAL (verified empirically with a controlled death + recovery on a real save): Lies of P DOES drop
+# your carried ergo on death and make you run back to a marker to reclaim it, exactly like souls/runes -- I
+# was just reading the wrong fields at first. In the save it shows up as two MUTUALLY EXCLUSIVE properties:
+#   - AcquisitionSoul -- your carried wallet ergo. Present while you hold ergo; ABSENT once you've died and
+#                        dropped it.
+#   - RemainErgo      -- the pending death-drop waiting at the marker (BaseErgo is its original amount).
+#                        ABSENT when you have no outstanding drop; PRESENT (== the dropped amount) from the
+#                        moment you die until you reclaim it.
+# So a pending death-drop (RemainErgo present) is the unambiguous "you died and haven't recovered" signal --
+# and unlike the wallet it can't be confused with a broke-but-alive character (0 wallet, no drop). We key the
+# clean-state on it: clean == no pending drop. read_vitals_lop returns (wallet, drop) and is_clean_state_lop
+# treats drop == 0 as clean. (An earlier attempt keyed on the HP property SecondStat_HeadthPoint vanishing on
+# death; that happens too, but it's a transient save-write artifact that also fires on non-deaths, so it's out.)
+#
+# Files are named SaveData-<slot>_Character_<n>.sav; the game writes a primary+backup pair per save (written a
+# few seconds apart, and they can briefly hold different states), and there can be several slots (different
+# characters). We watch/restore ONE file -- the most-recently-written SaveData-*_Character_*.sav, resolved at
+# startup (_resolve_lop_save_filename) -- the active character. NOTE (still to confirm live): we restore only
+# the watched file; if a death-restore ever fails to "stick" it's most likely the game reloaded the sibling
+# backup instead, in which case we'd restore over the whole pair.
+LOP_GVAS_MAGIC = b"GVAS"
+LOP_WALLET_PROPERTY = "AcquisitionSoul"  # carried ergo; present while held, ABSENT once dropped on death (display only)
+LOP_DROP_PROPERTY = "RemainErgo"  # pending death-drop at the marker; PRESENT(>0) == you died & haven't recovered == the death signal
+LOP_SAVE_GLOB = "SaveData-*_Character_*.sav"  # per-character save files; excludes Account_*/OptionSlot
+
 # ---- Per-game profiles ---------------------------------------------------
 
 
@@ -202,9 +239,48 @@ def _find_default_save_dir_ds2():
     return _find_default_subfolder_dir(os.path.join(appdata, "DarkSoulsII")) if appdata else None
 
 
+def _find_default_save_dir_lop():
+    """Lies of P saves live under its Steam install (e.g. <SteamLibrary>\\steamapps\\common\\Lies of P\\
+    LiesofP\\Saved\\SaveGames\\<id>\\). That library can be on any drive, so there's nothing reliable to
+    auto-detect -- the user passes the SaveGames\\<id> folder explicitly."""
+    return None
+
+
+def _resolve_lop_save_filename(save_dir):
+    """Lies of P has no single fixed save filename: a folder holds SaveData-<slot>_Character_<n>.sav files
+    for possibly several characters, each written as a primary+backup pair. Return the basename of the most-
+    recently-modified one (the character currently being played), or None if the folder has no such file."""
+    import glob
+    files = [f for f in glob.glob(os.path.join(save_dir, LOP_SAVE_GLOB)) if " - Kopie" not in os.path.basename(f)]
+    if not files:
+        return None
+    return os.path.basename(max(files, key=os.path.getmtime))
+
+
+# SaveData-<slot>_Character_<n>.sav: <slot> identifies the character; _Character_1 / _Character_2 are the
+# A/B double-buffer that the game writes alternately for that one character (they leapfrog -- either can hold
+# the freshest state at a given instant). "The pair" below = both buffers of a single character.
+_LOP_PAIR_RE = re.compile(r"(SaveData-\d+)_Character_\d+\.sav$", re.IGNORECASE)
+
+
+def _lop_pair_paths(path):
+    """Return every file that is part of the same LoP save as `path` (the A/B double-buffer pair for one
+    character), newest last. Falls back to just [path] if the name doesn't match the expected pattern."""
+    import glob
+    base = os.path.basename(path)
+    m = _LOP_PAIR_RE.match(base)
+    if not m:
+        return [path]
+    siblings = [f for f in glob.glob(os.path.join(os.path.dirname(path), m.group(1) + "_Character_*.sav"))
+                if " - Kopie" not in os.path.basename(f)]
+    return sorted(siblings or [path], key=os.path.getmtime)
+
+
 # char_entries = the BND4 entry indices that hold character data, used for active-character detection
 # (entry_fingerprints/changed_slot). er/dsr/ds3 store characters directly in entries 0-9; DS2 stores them in
 # entries 1-10 (its entry 0 is a header that's rewritten every save -- see the DS2 comment block above).
+# Lies of P isn't a BND4 container at all, so char_entries is unused for it (detection no-ops) and instead
+# it supplies resolve_save_filename to pick the active .sav out of the folder at startup.
 GAME_PROFILES = {
     "er": {
         "save_filename": "ER0000.sl2",
@@ -225,6 +301,12 @@ GAME_PROFILES = {
         "save_filename": "DS2SOFS0000.sl2",
         "find_default_save_dir": _find_default_save_dir_ds2,
         "char_entries": range(1, 11),
+    },
+    "lop": {
+        "save_filename": None,  # resolved from the folder at startup (see resolve_save_filename)
+        "resolve_save_filename": _resolve_lop_save_filename,
+        "find_default_save_dir": _find_default_save_dir_lop,
+        "char_entries": range(10),  # unused for lop (not a BND4 container); detection no-ops
     },
 }
 
@@ -514,18 +596,135 @@ def read_vitals_ds2(path, slot=None):
         return None, None
 
 
+def _gvas_read_fstring(raw, pos):
+    """
+    Reads a UE FString at pos: int32 length (which INCLUDES the trailing null),
+    then that many bytes. Returns (text, next_pos), or (None, pos) if the length
+    looks implausible (so a coincidental byte match doesn't run us off the rails).
+    """
+    n = struct.unpack_from("<i", raw, pos)[0]
+    if n <= 0 or n > 512:
+        return None, pos
+    return raw[pos + 4:pos + 4 + n - 1].decode("ascii", "replace"), pos + 4 + n
+
+
+def _gvas_read_int_property(raw, name):
+    """
+    Locate a UE IntProperty by name in an uncompressed GVAS blob and return its
+    int32 value, or None if not found. UE serializes a property as: FString name,
+    FString type, int64 payload-size, 1 byte (optional-GUID present flag), then
+    the value -- for IntProperty a 4-byte int. We match the name as a proper
+    FString (verifying the int32 length-with-null prefix right before it) so we
+    don't latch onto the same bytes appearing elsewhere, then read the int after
+    the 'IntProperty' type tag. This is the same "find a known field by name and
+    read a fixed distance from it" tactic used for DS3, just for UE's format.
+    """
+    nb = name.encode("ascii")
+    i = 0
+    while True:
+        j = raw.find(nb, i)
+        if j < 0:
+            return None
+        i = j + 1
+        if j < 4 or struct.unpack_from("<i", raw, j - 4)[0] != len(nb) + 1:
+            continue  # not an FString-prefixed name here -- a coincidental byte match
+        typ, pos = _gvas_read_fstring(raw, j + len(nb) + 1)  # skip name bytes + null terminator
+        if typ != "IntProperty":
+            continue
+        # int64 payload size (8 bytes) + 1 byte has-guid flag, then the int32 value
+        return struct.unpack_from("<i", raw, pos + 8 + 1)[0]
+
+
+def read_vitals_lop(path, slot=None):
+    """Returns (wallet, drop) for the Lies of P save at path, or (None, None) if the file can't be read.
+    slot is ignored (Lies of P isn't a BND4 multi-slot container). wallet = carried ergo (AcquisitionSoul;
+    0 when the property is absent == dropped on death); drop = the pending death-drop amount (RemainErgo;
+    0 when absent == nothing outstanding). is_clean_state_lop keys on drop == 0. These map onto the generic
+    (health, souls) slots so the rest of the pipeline -- logging, snapshotting, restore -- works unchanged."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None, None
+    if raw[:4] != LOP_GVAS_MAGIC:
+        return None, None
+    try:
+        wallet = _gvas_read_int_property(raw, LOP_WALLET_PROPERTY)
+        drop = _gvas_read_int_property(raw, LOP_DROP_PROPERTY)
+    except struct.error:
+        return None, None
+    # Absent property -> 0. Wallet absent means you dropped it on death; drop absent means nothing outstanding.
+    return (wallet or 0), (drop or 0)
+
+
+def _lop_debug_fields(path):
+    """Diagnostic dump for Lies of P: for the watched file AND its Character-pair sibling(s), report the raw
+    AcquisitionSoul (wallet) and RemainErgo (drop) properties and mtime -- so the log shows exactly which file
+    holds the pending-drop death state and when the pair fall out of sync."""
+    import glob
+    directory = os.path.dirname(path)
+    match = re.match(r"(SaveData-\d+)_Character_\d+\.sav$", os.path.basename(path))
+    group = match.group(1) if match else None
+    files = sorted(glob.glob(os.path.join(directory, f"{group}_Character_*.sav"))) if group else [path]
+    parts = []
+    for f in files:
+        try:
+            raw = open(f, "rb").read()
+            wallet = _gvas_read_int_property(raw, LOP_WALLET_PROPERTY)   # AcquisitionSoul (carried ergo)
+            drop = _gvas_read_int_property(raw, LOP_DROP_PROPERTY)       # RemainErgo (ergo left in the drop)
+            base = _gvas_read_int_property(raw, "BaseErgo")              # original amount of the drop
+            stolen = _gvas_read_int_property(raw, "StolenDropErgo")      # ergo an enemy stole from the drop
+            parts.append(f"{os.path.basename(f)}[wallet={wallet} drop={drop} base={base} stolen={stolen} mtime={os.path.getmtime(f):.0f}]")
+        except OSError:
+            pass
+    return " | ".join(parts)
+
+
 def is_clean_state(health, souls):
     """
-    A snapshot/state is only trustworthy as a "good" checkpoint if the player
-    is both alive (health > 0) AND has already reclaimed their runes
-    (souls > 0). The gap right after respawning -- alive again, but runes
-    still sitting unclaimed at the death location -- is excluded too, not
-    just the moment of death itself. None readings are treated as "allow"
-    since we can't determine the state and don't want to block on that.
+    Default (FromSoftware) clean check: a snapshot/state is only trustworthy as
+    a "good" checkpoint if the player is both alive (health > 0) AND has already
+    reclaimed their runes (souls > 0). The gap right after respawning -- alive
+    again, but runes still sitting unclaimed at the death location -- is excluded
+    too, not just the moment of death itself. None readings are treated as
+    "allow" since we can't determine the state and don't want to block on that.
+
+    Lies of P uses a DIFFERENT check (is_clean_state_lop) -- see there for why.
     """
     if health is None or souls is None:
         return True
     return health != 0 and souls != 0
+
+
+def is_clean_state_lop(wallet, drop):
+    """
+    Lies of P clean check: clean iff there is NO pending death-drop (drop == 0).
+    See the LOP_* constants block for the full reasoning. Keying on the drop
+    (rather than the wallet) is what makes this robust:
+      - died, not recovered -> drop > 0  -> UNCLEAN (restore-worthy),
+      - alive holding ergo   -> drop == 0 -> clean,
+      - alive but broke (spent all ergo, no drop) -> drop == 0 -> clean, NOT a
+        false death.
+    (Parameter names wallet/drop mirror read_vitals_lop's return; they occupy
+    the generic health/souls slots the watcher passes in.)
+    """
+    return drop == 0
+
+
+def is_restore_point_lop(wallet, drop):
+    """
+    Lies of P restore-point check: a state is worth snapshotting / restoring to
+    ONLY if you're holding ergo (wallet > 0) AND have no pending death-drop
+    (drop == 0).
+
+    This is STRICTER than is_clean_state_lop (the death trigger). The trigger
+    keys on drop alone so a broke-but-alive state (wallet == 0, drop == 0) is not
+    mistaken for a death. But we never want to *restore you into* a 0-ergo state
+    -- that would throw away ergo for no benefit -- so the restore-point predicate
+    additionally requires wallet > 0. Net effect: die -> restored to the last
+    Stargazer where you actually had ergo in your wallet and nothing dropped.
+    """
+    return wallet > 0 and drop == 0
 
 
 def _md5_file(path):
@@ -555,13 +754,13 @@ def copy_and_verify(source, dest, max_attempts=RESTORE_VERIFY_MAX_ATTEMPTS):
     return False, last_exc
 
 
-def _kopie_name_re(save_stem):
-    return re.compile(rf"^{re.escape(save_stem)} - Kopie(?: \((\d+)\))?\.sl2$")
+def _kopie_name_re(save_stem, save_ext=".sl2"):
+    return re.compile(rf"^{re.escape(save_stem)} - Kopie(?: \((\d+)\))?{re.escape(save_ext)}$")
 
 
-def list_numbered_kopies(save_dir, save_stem):
+def list_numbered_kopies(save_dir, save_stem, save_ext=".sl2"):
     """Return [(number, path), ...] for files matching the Kopie naming scheme, newest (highest number) first."""
-    name_re = _kopie_name_re(save_stem)
+    name_re = _kopie_name_re(save_stem, save_ext)
     found = []
     for name in os.listdir(save_dir):
         match = name_re.match(name)
@@ -572,10 +771,10 @@ def list_numbered_kopies(save_dir, save_stem):
     return found
 
 
-def next_kopie_path(save_dir, save_stem):
-    existing = list_numbered_kopies(save_dir, save_stem)
+def next_kopie_path(save_dir, save_stem, save_ext=".sl2"):
+    existing = list_numbered_kopies(save_dir, save_stem, save_ext)
     next_number = existing[0][0] + 1 if existing else 1
-    name = f"{save_stem} - Kopie.sl2" if next_number == 1 else f"{save_stem} - Kopie ({next_number}).sl2"
+    name = f"{save_stem} - Kopie{save_ext}" if next_number == 1 else f"{save_stem} - Kopie ({next_number}){save_ext}"
     return os.path.join(save_dir, name)
 
 
@@ -584,7 +783,7 @@ def _watcher_state_file(save_stem):
     return os.path.join(_APP_DIR, f"watcher_state_{save_stem}.txt")
 
 
-def load_or_init_kopie_baseline(save_dir, save_stem):
+def load_or_init_kopie_baseline(save_dir, save_stem, save_ext=".sl2"):
     """
     Returns the Kopie number at or below which files are pre-existing (manual
     backups predating the watcher, never touched) and above which they were
@@ -599,7 +798,7 @@ def load_or_init_kopie_baseline(save_dir, save_stem):
             return int(f.read().strip())
     except (OSError, ValueError):
         pass
-    existing = list_numbered_kopies(save_dir, save_stem)
+    existing = list_numbered_kopies(save_dir, save_stem, save_ext)
     baseline = existing[0][0] if existing else 0
     try:
         with open(state_file, "w", encoding="utf-8") as f:
@@ -614,12 +813,32 @@ def load_or_init_kopie_baseline(save_dir, save_stem):
 class SaveWatcher:
     def __init__(self, path, save_stem, read_vitals_fn, on_change, on_snapshot, on_snapshot_failed,
                  on_death_restore, on_death_restore_failed, on_prune, on_prune_failed, on_active_slot,
-                 use_adaptive_rewind=False, slot_override=None, char_entries=range(10)):
+                 use_adaptive_rewind=False, slot_override=None, char_entries=range(10), save_ext=".sl2",
+                 on_debug=None, debug_fields_fn=None, clean_state_fn=is_clean_state,
+                 restore_point_fn=None, follow_pair=False, vital_labels=("health", "souls")):
         self.path = path
         self.save_dir = os.path.dirname(path)
         self.save_stem = save_stem
+        self.save_ext = save_ext
+        # Lies of P writes each save as an A/B double-buffer pair (_Character_1 / _Character_2) that leapfrog,
+        # so the freshest state can be in either file and a restore must overwrite BOTH. When follow_pair is on
+        # we track the pair and re-point self.path at whichever member is newest before each read. save_stem
+        # stays FIXED (from startup) so our Kopie names don't flip between the two buffers. Off (FromSoft
+        # games) -> a single fixed file, pair == [path].
+        self.follow_pair = follow_pair
+        self.pair_paths = _lop_pair_paths(path) if follow_pair else [path]
         self.read_vitals = read_vitals_fn
         self.char_entries = char_entries
+        self.is_clean = clean_state_fn  # per-game clean-state predicate (FromSoft default; lop overrides)
+        # Predicate for states worth SNAPSHOTTING / RESTORING TO. Stricter than
+        # is_clean (the death trigger): defaults to is_clean, but lop passes
+        # is_restore_point_lop (wallet > 0 AND drop == 0) so we never snapshot or
+        # restore into a 0-ergo state. See is_restore_point_lop for the rationale.
+        self.is_restore_point = restore_point_fn or clean_state_fn
+        self.vital_labels = vital_labels  # (name0, name1) for the two vitals in logs; lop = ("wallet", "drop")
+        self.on_debug = on_debug  # log-only diagnostic sink (or None to disable)
+        self.debug_fields_fn = debug_fields_fn  # optional path -> extra-fields string, logged on each change
+        self._prev_clean = None  # for logging clean<->unclean transitions in _check_death
         self.on_change = on_change
         self.on_snapshot = on_snapshot
         self.on_snapshot_failed = on_snapshot_failed
@@ -634,9 +853,10 @@ class SaveWatcher:
         self._last_mtime = None
         self._last_hash = None
         self._death_restore_pending = False
+        self._observed_clean = False  # have we seen a clean state since startup? gates restore (see _check_death)
         self._death_restore_skip = 0  # adaptive rewind only: how many extra clean snapshots back to skip
         self._last_death_restore_monotonic = None  # adaptive rewind only: when the last death-restore happened
-        self._kopie_baseline = load_or_init_kopie_baseline(self.save_dir, self.save_stem)
+        self._kopie_baseline = load_or_init_kopie_baseline(self.save_dir, self.save_stem, self.save_ext)
         # Which character slot to read vitals from. These games store up to 10 characters in one .sl2; only
         # the one being played is rewritten on save, so we detect it by which BND4 entry's checksum changes
         # (see entry_fingerprints/changed_slot). None until determined -> read_vitals falls back to the first
@@ -651,7 +871,7 @@ class SaveWatcher:
         # recent snapshots -- two consecutive saves of the active character differ only in that slot.
         if self.slot_override is not None:
             return
-        kopies = list_numbered_kopies(self.save_dir, self.save_stem)
+        kopies = list_numbered_kopies(self.save_dir, self.save_stem, self.save_ext)
         if len(kopies) >= 2:
             cand = changed_slot(
                 entry_fingerprints(kopies[1][1], self.char_entries),
@@ -659,6 +879,19 @@ class SaveWatcher:
             )
             if cand is not None:
                 self._active_slot = cand
+
+    def _follow_active_file(self):
+        """LoP double-buffers each save across the _Character_1/_Character_2 pair, and the two leapfrog, so the
+        freshest state may be in either file. Point self.path at whichever pair member is newest before we read,
+        so we never watch a stale buffer. No-op for the single-file (FromSoft) games."""
+        if not self.follow_pair:
+            return
+        try:
+            newest = max(self.pair_paths, key=os.path.getmtime)
+        except (OSError, ValueError):
+            return  # a member briefly missing/locked mid-write; keep the current path and retry next tick
+        if newest != self.path:
+            self.path = newest
 
     def _refresh_active_slot(self, path):
         if self.slot_override is not None:
@@ -683,6 +916,7 @@ class SaveWatcher:
         return h.hexdigest()
 
     def _poll_once(self):
+        self._follow_active_file()  # LoP: track whichever buffer of the pair is newest before reading
         try:
             stat = os.stat(self.path)
         except FileNotFoundError:
@@ -702,9 +936,18 @@ class SaveWatcher:
         self._refresh_active_slot(self.path)  # re-detect active character before reading its vitals
         health, souls = self._read_vitals(self.path)
         self.on_change(size, delta, digest[:12], health, souls)
-        if delta is None:  # don't snapshot the initial baseline read, only real changes
-            return
-        if is_clean_state(health, souls):
+        if self.on_debug is not None and self.debug_fields_fn is not None:
+            try:
+                self.on_debug(f"change: delta={delta} clean={self.is_clean(health, souls)} :: {self.debug_fields_fn(self.path)}")
+            except Exception as exc:  # diagnostics must never break the watcher
+                self.on_debug(f"change: debug_fields_fn error: {exc}")
+        # Snapshot any restore-worthy state, INCLUDING the very first (baseline) read where delta is None. A
+        # watcher started with no prior Kopie files must capture a restore point immediately -- otherwise a death
+        # before the game's next on-disk save (Lies of P only saves at checkpoints, so that can be minutes)
+        # has nothing to roll back to. This is exactly what bit the first Lies of P death test.
+        # is_restore_point is stricter than is_clean for lop (requires wallet > 0), so we don't snapshot a
+        # broke-but-alive state and later restore you into having no ergo.
+        if self.is_restore_point(health, souls):
             self._snapshot_change()
 
     def _check_death(self):
@@ -715,15 +958,41 @@ class SaveWatcher:
         # a restore done then sticks (the game reloads from disk on Continue). We read the file's actual mtime
         # each check (rather than a timer maintained elsewhere) so this is immune to poll-ordering races -- and
         # since our own restore write bumps the mtime, it also can't immediately re-fire on its own restore.
+        self._follow_active_file()  # LoP: judge quiet-time / vitals from whichever buffer is newest
         try:
             seconds_since_write = time.time() - os.path.getmtime(self.path)
         except OSError:
             return
         health, souls = self._read_vitals(self.path)
         if health is None or souls is None:
-            return
-        if is_clean_state(health, souls):
+            return  # couldn't read a vital (file locked mid-write) -- try again next tick
+        clean = self.is_clean(health, souls)
+        if self.on_debug is not None:
+            # Log the death-check verdict on every clean<->unclean transition, and every tick while unclean
+            # (so a death episode shows the quiet-gate countdown). Silent during normal clean play.
+            vitals = f"{self.vital_labels[0]}={health} {self.vital_labels[1]}={souls}"
+            if clean != self._prev_clean:
+                self.on_debug(f"death-check: -> {'CLEAN' if clean else 'UNCLEAN'} ({vitals} quiet={seconds_since_write:.1f}s)")
+                if not clean and self.debug_fields_fn is not None:
+                    # A death was just detected -- log exactly what the game wrote to the save on death.
+                    try:
+                        self.on_debug(f"death-check: SAVED-ON-DEATH :: {self.debug_fields_fn(self.path)}")
+                    except Exception as exc:
+                        self.on_debug(f"death-check: death-dump error: {exc}")
+            elif not clean and not self._death_restore_pending:
+                # Log the quiet-gate countdown only until the restore is attempted; once pending, stop
+                # logging every tick so a lingering unclean state (e.g. restore failed) can't flood the log.
+                self.on_debug(f"death-check: still UNCLEAN ({vitals} quiet={seconds_since_write:.1f}s/{DEATH_RESTORE_DELAY_SECONDS}s)")
+            self._prev_clean = clean
+        if clean:
+            self._observed_clean = True  # from here on, an unclean read is a death we actually witnessed
             self._death_restore_pending = False
+            return
+        if not self._observed_clean:
+            # The save was ALREADY unclean when we started watching -- a death (or, for Lies of P, a still-
+            # pending ergo drop) that happened before us. Don't restore it: acting on a pre-existing unclean
+            # state means clobbering whatever the player has done since (e.g. an in-game recovery the game
+            # hasn't written to disk yet). Only ever restore a clean->unclean transition we saw happen live.
             return
         if self._death_restore_pending:
             return  # already attempted a restore for this unclean episode; wait for it to clear
@@ -734,7 +1003,7 @@ class SaveWatcher:
 
     def _snapshot_change(self):
         try:
-            dest = next_kopie_path(self.save_dir, self.save_stem)
+            dest = next_kopie_path(self.save_dir, self.save_stem, self.save_ext)
             shutil.copy2(self.path, dest)  # new file only; never overwrites an existing Kopie file
         except OSError as exc:
             self.on_snapshot_failed(str(exc))
@@ -751,7 +1020,7 @@ class SaveWatcher:
         # snapshots before it can resume. Files at/below the baseline
         # (pre-existing manual backups) are never included here.
         own = sorted(
-            (number, p) for number, p in list_numbered_kopies(self.save_dir, self.save_stem)
+            (number, p) for number, p in list_numbered_kopies(self.save_dir, self.save_stem, self.save_ext)
             if number > self._kopie_baseline
         )
         while len(own) > KOPIE_RETENTION_COUNT:
@@ -765,17 +1034,17 @@ class SaveWatcher:
 
     def _restore_after_death(self, trigger_health, trigger_souls):
         try:
-            kopies = list_numbered_kopies(self.save_dir, self.save_stem)
+            kopies = list_numbered_kopies(self.save_dir, self.save_stem, self.save_ext)
         except OSError as exc:
             self.on_death_restore_failed(str(exc))
             return
-        clean_candidates = []  # newest first; only ones that are a clean (alive + souls reclaimed) state
+        clean_candidates = []  # newest first; only ones that are a valid restore point per this game's rule
         for _, candidate in kopies:
             health, souls = self._read_vitals(candidate)
-            if health is not None and souls is not None and health != 0 and souls != 0:
+            if health is not None and souls is not None and self.is_restore_point(health, souls):
                 clean_candidates.append(candidate)
         if not clean_candidates:
-            self.on_death_restore_failed("no clean (health > 0 and souls > 0) snapshot found to restore from")
+            self.on_death_restore_failed("no clean snapshot found to restore from")
             return
 
         skip = 0
@@ -793,11 +1062,18 @@ class SaveWatcher:
             skip = min(self._death_restore_skip, len(clean_candidates) - 1)
 
         source = clean_candidates[skip]
-        ok, exc = copy_and_verify(source, self.path)  # one-way copy; source file is never renamed/moved/deleted
-        if not ok:
-            reason = str(exc) if exc else f"MD5 of restored file never matched source after {RESTORE_VERIFY_MAX_ATTEMPTS} attempts"
-            self.on_death_restore_failed(reason)
-            return
+        # Overwrite EVERY file of the save. FromSoft games -> the single watched file. Lies of P -> both
+        # buffers of the A/B pair, so the restored state loads no matter which buffer the game reads on
+        # Continue (writing only one could leave the game loading the stale other buffer). One-way copies; the
+        # source Kopie is never renamed/moved/deleted.
+        targets = self.pair_paths if self.follow_pair else [self.path]
+        for target in targets:
+            ok, exc = copy_and_verify(source, target)
+            if not ok:
+                reason = str(exc) if exc else f"MD5 of restored file never matched source after {RESTORE_VERIFY_MAX_ATTEMPTS} attempts"
+                self.on_death_restore_failed(reason)
+                return
+        self._follow_active_file()  # re-point self.path at the newest just-written buffer before re-baselining
         stat = os.stat(self.path)
         self._last_size, self._last_mtime = stat.st_size, stat.st_mtime
         self._last_hash = self._hash_file(self.path)
@@ -824,12 +1100,19 @@ def _write_log(line):
         f.write(line + "\n")
 
 
-def log_change(size, delta, short_hash, health, souls):
+def log_change(size, delta, short_hash, health, souls, labels=("health", "souls")):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     delta_str = "first snapshot" if delta is None else f"{delta:+d} bytes"
-    line = f"[{timestamp}] size={size} ({delta_str}) hash={short_hash} health={health} souls={souls}"
+    vitals = f"{labels[0]}={health} {labels[1]}={souls}"
+    line = f"[{timestamp}] size={size} ({delta_str}) hash={short_hash} {vitals}"
     _write_log(line)
-    return f"{timestamp}  {delta_str}  #{short_hash}  health={health} souls={souls}"
+    return f"{timestamp}  {delta_str}  #{short_hash}  {vitals}"
+
+
+def log_debug(msg):
+    # Diagnostic-only: written to the log file, NOT pushed to the overlay (so it can't spam the on-screen box).
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _write_log(f"[{timestamp}] DEBUG: {msg}")
 
 
 def log_snapshot(name):
@@ -860,12 +1143,13 @@ def log_prune_failed(reason):
     return f"{timestamp}  PRUNE FAILED: {reason}"
 
 
-def log_death_restore(source_name, health, souls, skip):
+def log_death_restore(source_name, health, souls, skip, labels=("health", "souls")):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     skip_str = f" (skipped {skip} more recent clean snapshot{'s' if skip != 1 else ''})" if skip else ""
-    line = f"[{timestamp}] UNCLEAN STATE (health={health}, souls={souls}) -- RESTORED '{source_name}' -> live save{skip_str}"
+    vitals = f"{labels[0]}={health}, {labels[1]}={souls}"
+    line = f"[{timestamp}] UNCLEAN STATE ({vitals}) -- RESTORED '{source_name}' -> live save{skip_str}"
     _write_log(line)
-    return f"{timestamp}  RESTORED '{source_name}' (was health={health}, souls={souls}){skip_str}"
+    return f"{timestamp}  RESTORED '{source_name}' (was {vitals}){skip_str}"
 
 
 def log_death_restore_failed(reason):
@@ -967,21 +1251,74 @@ class Overlay:
 # ---- Wiring -----------------------------------------------------------------
 
 
+def _short_help():
+    prog = os.path.basename(sys.executable if getattr(sys, "frozen", False) else sys.argv[0]) or "er_save_watcher.py"
+    return (
+        ".sl2 / .sav Save Watcher -- snapshots your save while you play and auto-restores\n"
+        "your last good checkpoint after you die.\n"
+        "\n"
+        f"Usage:  {prog} -g GAME [SAVE_FOLDER]\n"
+        "\n"
+        "Games (-g):\n"
+        "  er   Elden Ring             (save folder auto-detected)\n"
+        "  dsr  Dark Souls Remastered  (save folder auto-detected)\n"
+        "  ds3  Dark Souls III         (save folder auto-detected)\n"
+        "  ds2  Dark Souls II: SOTFS   (save folder auto-detected)\n"
+        "  lop  Lies of P              (pass the SaveGames\\<id> folder)\n"
+        "\n"
+        "Examples:\n"
+        f"  {prog} -g er\n"
+        f"  {prog} -g lop \"G:\\SteamLibrary\\steamapps\\common\\Lies of P\\LiesofP\\Saved\\SaveGames\\7062576\"\n"
+        "\n"
+        f"Full options:  {prog} -h"
+    )
+
+
+def _show_help_dialog(text):
+    # The exe is built --windowed (no console), so anything printed to stderr is invisible when it's double-
+    # clicked. Pop the same help text in a small GUI box too. Best-effort: silently skip if there's no display.
+    try:
+        import tkinter.messagebox as messagebox
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        messagebox.showinfo("Save Watcher", text)
+        root.destroy()
+    except Exception:
+        pass
+
+
+class _HelpfulParser(argparse.ArgumentParser):
+    # Route argparse errors (bad/missing/unknown arguments) through the GUI box as well as stderr -- same
+    # windowed-exe reason as above -- so a mistyped option isn't a silent no-op, then exit.
+    def error(self, message):
+        text = f"{message}\n\n{_short_help()}"
+        print(text, file=sys.stderr)
+        _show_help_dialog(text)
+        self.exit(2)
+
+
 def parse_args():
-    pre_parser = argparse.ArgumentParser(add_help=False)
+    if len(sys.argv) == 1:  # no arguments at all (e.g. the exe was double-clicked) -> show help and stop
+        print(_short_help(), file=sys.stderr)
+        _show_help_dialog(_short_help())
+        sys.exit(0)
+
+    pre_parser = _HelpfulParser(add_help=False)
     pre_parser.add_argument("-g", "--game", choices=sorted(GAME_PROFILES), default="er")
     pre_args, _ = pre_parser.parse_known_args()
     profile = GAME_PROFILES[pre_args.game]
     auto_detected = profile["find_default_save_dir"]()
+    save_target = profile["save_filename"] or "the active SaveData-*.sav (auto-picked from the folder)"
 
-    parser = argparse.ArgumentParser(description="FromSoftware .sl2 save watcher with auto-restore and on-screen overlay.")
+    parser = _HelpfulParser(description="FromSoftware .sl2 / Lies of P .sav save watcher with auto-restore and on-screen overlay.")
     parser.add_argument(
         "-g", "--game", choices=sorted(GAME_PROFILES), default="er",
         help="Which game's save format to use (default: er). Determines the save filename and Kopie naming.",
     )
     parser.add_argument(
         "save_dir", nargs="?", default=auto_detected,
-        help=f"Path to the save folder containing {profile['save_filename']}"
+        help=f"Path to the save folder containing {save_target}"
              + (f" (default, auto-detected: {auto_detected})" if auto_detected else
                 " (required: couldn't auto-detect a unique save folder for this game)"),
     )
@@ -989,7 +1326,7 @@ def parse_args():
         "-s", "--slot", type=int, default=None,
         help="Force a specific character slot (0-9) instead of auto-detecting the active one. "
              "Normally unnecessary -- the watcher detects which character is being played by which "
-             "save slot changes -- but useful to override if detection picks wrong.",
+             "save slot changes -- but useful to override if detection picks wrong. (Ignored for lop.)",
     )
     args = parser.parse_args()
     if args.save_dir is None:
@@ -1005,8 +1342,28 @@ def main():
     args = parse_args()
     profile = GAME_PROFILES[args.game]
     save_filename = profile["save_filename"]
-    save_stem = save_filename[:-len(".sl2")]
+    resolver = profile.get("resolve_save_filename")
+    if resolver is not None:  # lop: no fixed filename -- pick the active save out of the folder
+        save_filename = resolver(args.save_dir)
+        if save_filename is None:
+            print(
+                f"ERROR: couldn't find a {args.game} save file (matching '{LOP_SAVE_GLOB}') in:\n"
+                f"  {args.save_dir}\n"
+                "Point the tool at the game's SaveGames\\<id> folder.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    save_stem, save_ext = os.path.splitext(save_filename)
     save_file = os.path.join(args.save_dir, save_filename)
+    if args.game == "lop":
+        # Name Kopie files after the character's stable SaveData-<slot> prefix, NOT the raw filename: the raw
+        # name carries the A/B buffer number (_Character_1 / _Character_2) that flips depending on which buffer
+        # was newest at startup, so a buffer-derived stem would make each run create/look-for a different Kopie
+        # series. The slot prefix is stable across runs and, lacking "_Character_", keeps our Kopie files from
+        # matching the save globs. (save_file still points at the actual buffer we watch.)
+        m = _LOP_PAIR_RE.match(save_filename)
+        if m:
+            save_stem = m.group(1)
 
     if args.game in ("dsr", "ds3", "ds2"):
         try:
@@ -1019,6 +1376,8 @@ def main():
             )
             sys.exit(1)
         read_vitals_fn = {"dsr": read_vitals_dsr, "ds3": read_vitals_ds3, "ds2": read_vitals_ds2}[args.game]
+    elif args.game == "lop":
+        read_vitals_fn = read_vitals_lop
     else:
         read_vitals_fn = read_vitals_er
 
@@ -1026,8 +1385,11 @@ def main():
     pending = deque()
     pending_lock = threading.Lock()
 
+    # For Lies of P the two vitals are the ergo wallet and the pending death-drop, not health/souls.
+    vital_labels = ("wallet", "drop") if args.game == "lop" else ("health", "souls")
+
     def on_change(size, delta, short_hash, health, souls):
-        line = log_change(size, delta, short_hash, health, souls)
+        line = log_change(size, delta, short_hash, health, souls, vital_labels)
         with pending_lock:
             pending.append(line)
 
@@ -1043,7 +1405,7 @@ def main():
             pending.append(line)
 
     def on_death_restore(source_name, health, souls, skip):
-        line = log_death_restore(source_name, health, souls, skip)
+        line = log_death_restore(source_name, health, souls, skip, vital_labels)
         with pending_lock:
             pending.append(line)
         play_restore_sound()
@@ -1068,10 +1430,19 @@ def main():
         with pending_lock:
             pending.append(line)
 
+    def on_debug(msg):  # diagnostic, log-file only (never touches the overlay)
+        log_debug(msg)
+
+    debug_fields_fn = _lop_debug_fields if args.game == "lop" else None
+    clean_state_fn = is_clean_state_lop if args.game == "lop" else is_clean_state
+    restore_point_fn = is_restore_point_lop if args.game == "lop" else None
+
     watcher = SaveWatcher(
         save_file, save_stem, read_vitals_fn, on_change, on_snapshot, on_snapshot_failed,
         on_death_restore, on_death_restore_failed, on_prune, on_prune_failed, on_active_slot,
         use_adaptive_rewind=False, slot_override=args.slot, char_entries=profile["char_entries"],
+        save_ext=save_ext, on_debug=on_debug, debug_fields_fn=debug_fields_fn, clean_state_fn=clean_state_fn,
+        restore_point_fn=restore_point_fn, follow_pair=(args.game == "lop"), vital_labels=vital_labels,
     )
     thread = threading.Thread(target=watcher.run, daemon=True)
     thread.start()
