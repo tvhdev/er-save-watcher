@@ -1,6 +1,6 @@
-# .sl2 Save Watcher
+# .sl2 / .sav Save Watcher
 
-A little Windows tool that watches your Elden Ring, Dark Souls Remastered, Dark Souls III, or Dark Souls II: Scholar of the First Sin save file while you play, and after you die, automatically restores your last good checkpoint with acoustic notification. This way you continue where you died and you save a lot of time because you don't need to run to the place you died to pickup your runes!
+A little Windows tool that watches your Elden Ring, Dark Souls Remastered, Dark Souls III, Dark Souls II: Scholar of the First Sin, or Lies of P save file while you play, and after you die, automatically restores your last good checkpoint with acoustic notification. This way you continue where you died and you save a lot of time because you don't need to run to the place you died to pick up your runes (or **ergo**, in Lies of P)!
 
 ## Supported games
 
@@ -10,14 +10,17 @@ A little Windows tool that watches your Elden Ring, Dark Souls Remastered, Dark 
 | Dark Souls Remastered | `dsr` | `DRAKS0005.sl2` | `<Documents>\NBGI\DARK SOULS REMASTERED\<SteamID>\` |
 | Dark Souls III | `ds3` | `DS30000.sl2` | `%APPDATA%\DarkSoulsIII\<id>\` |
 | Dark Souls II: Scholar of the First Sin | `ds2` | `DS2SOFS0000.sl2` | `%APPDATA%\DarkSoulsII\<id>\` |
+| Lies of P | `lop` | `SaveData-<slot>_Character_<n>.sav` | *(pass the `SaveGames\<id>` folder — not auto-detected)* |
 
 These use completely different save formats under the hood (Elden Ring's is unencrypted; DSR's, DS3's, and DS2's are AES-128-CBC encrypted per character slot, each with its own key), but the tool behaves the same way from the outside regardless of which one you pick. DSR, DS3, and DS2 additionally need the `cryptography` Python package installed (see Running it below) — Elden Ring needs nothing extra.
+
+Lies of P is different again: its saves are plain **Unreal Engine GVAS** files (uncompressed and unencrypted), so it too needs nothing extra. Its "runes" are called **ergo**, and its save folder can't be auto-detected (the Steam install path varies by library location), so you always pass the folder explicitly — point the tool at `...\Lies of P\LiesofP\Saved\SaveGames\<id>`. See the Lies of P notes under Known limitations for a couple of format-specific details.
 
 ## What to do after you die
 
 1. Die as normal and let the death animation play out.
 2. From the death screen, go back to the **main menu** instead of continuing to play — don't keep playing on the spot, since the game can overwrite the restore again while you're actively still in the session.
-3. Wait. The tool needs your health/runes (or souls, for DSR) to stay in an "unclean" state for a little while before it acts, so the restore doesn't happen instantly.
+3. Wait. The tool needs your health/runes (or souls, for DSR; or ergo, for Lies of P) to stay in an "unclean" state for a little while before it acts, so the restore doesn't happen instantly. In Lies of P specifically, give it a bit longer — the death→respawn sequence writes the save several times before it settles, so wait until you're actually sitting on the main menu and it's gone quiet.
 4. Listen for the **two-tone restore sound**. That's your signal that the last good checkpoint has been copied back over your save.
 5. Only now click **Continue**. Loading before the sound plays means you'd load the version of the save before the restore happened.
 
@@ -42,31 +45,32 @@ There are two ways to run this:
 Just double-click `ER_Save_Watcher.exe`, or run it from a terminal if you want to pass options explicitly:
 
 ```
-ER_Save_Watcher.exe [-g {er,dsr,ds3,ds2}] [-s SLOT] [save_dir]
+ER_Save_Watcher.exe [-g {er,dsr,ds3,ds2,lop}] [-s SLOT] [save_dir]
 ```
 
 ### Option B: run the Python script directly
 
 Requirements:
 - **Python 3** installed on Windows, including **tkinter** (bundled by default with the official python.org installer — just don't deselect it during setup).
-- For Elden Ring: no `pip install` of anything else — only Python's standard library is used.
-- For Dark Souls Remastered, Dark Souls III, or Dark Souls II: also run `pip install cryptography` once (needed to decrypt their save slots; not required at all for Elden Ring).
+- For Elden Ring or Lies of P: no `pip install` of anything else — only Python's standard library is used.
+- For Dark Souls Remastered, Dark Souls III, or Dark Souls II: also run `pip install cryptography` once (needed to decrypt their save slots; not required for Elden Ring or Lies of P).
 
 ```
-python er_save_watcher.py [-g {er,dsr,ds3,ds2}] [-s SLOT] [save_dir]
+python er_save_watcher.py [-g {er,dsr,ds3,ds2,lop}] [-s SLOT] [save_dir]
 ```
 
 ### Options
 
-- `-g`/`--game` picks the save format: `er` (Elden Ring, the default), `dsr` (Dark Souls Remastered), `ds3` (Dark Souls III), or `ds2` (Dark Souls II: Scholar of the First Sin).
-- `-s`/`--slot N` forces a specific character slot. **You normally never need this** — the character slot is selected **automatically**: a save holds up to 10 characters, but only the one you're actively playing is rewritten when the game saves, so the tool watches whichever slot changes and follows it if you switch characters. Use `-s` only to override that if auto-detection ever picks the wrong one.
-- `save_dir` is the folder containing the save file. If you don't pass one, it tries to auto-detect it (see the table above) — this only works automatically if you've only ever played with one Steam account on this PC; otherwise you'll need to pass the path yourself, e.g.:
+- `-g`/`--game` picks the save format: `er` (Elden Ring, the default), `dsr` (Dark Souls Remastered), `ds3` (Dark Souls III), `ds2` (Dark Souls II: Scholar of the First Sin), or `lop` (Lies of P).
+- `-s`/`--slot N` forces a specific character slot. **You normally never need this** — the character slot is selected **automatically**: a save holds up to 10 characters, but only the one you're actively playing is rewritten when the game saves, so the tool watches whichever slot changes and follows it if you switch characters. Use `-s` only to override that if auto-detection ever picks the wrong one. (It has no effect for Lies of P, which stores each character in its own file and is picked automatically.)
+- `save_dir` is the folder containing the save file. For the four FromSoft games, if you don't pass one it tries to auto-detect it (see the table above) — this only works automatically if you've only ever played with one Steam account on this PC; otherwise you'll need to pass the path yourself. **For Lies of P you must always pass it** (there's no fixed install location to auto-detect). Examples:
 
 ```
 ER_Save_Watcher.exe -g er "C:\Users\<you>\AppData\Roaming\EldenRing\<your SteamID>"
 ER_Save_Watcher.exe -g dsr "C:\Users\<you>\Documents\NBGI\DARK SOULS REMASTERED\<your SteamID>"
 ER_Save_Watcher.exe -g ds3 "C:\Users\<you>\AppData\Roaming\DarkSoulsIII\<your id>"
 ER_Save_Watcher.exe -g ds2 "C:\Users\<you>\AppData\Roaming\DarkSoulsII\<your id>"
+ER_Save_Watcher.exe -g lop "D:\SteamLibrary\steamapps\common\Lies of P\LiesofP\Saved\SaveGames\<your id>"
 ```
 
 No admin rights are needed either way — it only reads/writes your own save folder and writes its log next to wherever it's run from. If you have more than one save folder for the same game (e.g. two Steam accounts, or DSR's PS-import slot), each gets its own pruning/state tracking automatically — just point the tool at the right folder.
@@ -99,6 +103,7 @@ The first command builds the exe into the image; the second copies it out to `di
 - While the game is actively running, *it* holds the real, authoritative copy of your progress in memory — our restore can only "stick" once the game isn't actively fighting it (e.g. you've returned to the title screen). That's why the death-restore waits a while before acting, rather than firing the instant you die.
 - DS3's health/souls offsets weren't independently re-verified against two real characters the way DSR's were (see the module docstring) — they're sourced from a working, actively-used save editor, but carry somewhat lower confidence than DSR's.
 - For DS2, death detection runs on **souls only** (confirmed: souls drops to 0 on death and was verified against a live in-game value). The HP it shows for DS2 is the character's *base* max HP read from the save and is **informational only** — it doesn't include the bonuses HP-boosting rings apply in-game, so it can read lower than the number on your screen when such a ring is equipped. (DS2 also only saves after you respawn at a bonfire, i.e. at full HP, so its saved HP never reaches 0 anyway — which is exactly why souls, not HP, is the death signal there.)
+- **Lies of P** works on **ergo** rather than health: death detection fires when there's a pending death-drop (you died and haven't recovered your ergo), and it only ever snapshots / restores to a state where you're *holding* ergo with nothing dropped. Because of that, a restore rolls you back to your last such checkpoint — you get that wallet back rather than the dropped marker, which also means any ergo earned *since* that checkpoint is rolled back too. Lies of P also writes each save as an alternating **A/B buffer pair** (`_Character_1` / `_Character_2`); the tool follows whichever is newest and, on restore, overwrites both so the game loads the restored state no matter which it reads. Its snapshots are named after the character's stable `SaveData-<slot>` prefix (e.g. `SaveData-2 - Kopie (7).sav`).
 - This is a heuristic tool poking at undocumented file formats. It's been tested against one save file structure per game and should be used with that understanding — keep your own backups too.
 
 ## Credits
@@ -110,5 +115,6 @@ Figuring out *where* in the save file to look took real reverse-engineering work
 - **[jtesta/souls_givifier](https://github.com/jtesta/souls_givifier)** — showed us the generic BND4 container format shared across Dark Souls/Elden Ring saves, and the AES-128-CBC keys and decryption scheme for Dark Souls Remastered, Dark Souls III, and Dark Souls II: Scholar of the First Sin (including DS2's distinct layout, where the slot occupancy/name table lives in the first container entry and each character's data is one entry further along).
 - **[tarvitz/dsfp](https://github.com/tarvitz/dsfp)** — a documented field-offset table for original (unencrypted) Dark Souls that helped narrow down where to look in DSR's decrypted slot data, even though DSR's actual layout had shifted slightly from it.
 - **[alfizari/Dark-Souls-3-Save-Editor-PS4-PC](https://github.com/alfizari/Dark-Souls-3-Save-Editor-PS4-PC)** — a full DS3 save editor whose item-array-walking technique and health/souls offsets (relative to the end of that array) made DS3 support possible, the same general approach as Elden Ring's variable-length layout problem.
+- **[xcier/Lies-of-P-Save-Editor](https://github.com/xcier/Lies-of-P-Save-Editor)** — a Lies of P save editor that pointed us at the game's GVAS save layout and the ergo-related property names, which is what let us identify the wallet (`AcquisitionSoul`) and the recoverable death-drop (`RemainErgo`).
 
-Thank you to all five projects for doing the hard part.
+Thank you to all six projects for doing the hard part.
